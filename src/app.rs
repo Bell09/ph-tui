@@ -72,18 +72,6 @@ enum UpdateState {
     Newer(String),
 }
 
-impl UpdateState {
-    fn short(&self) -> String {
-        match self {
-            UpdateState::Checking => "checking…".to_string(),
-            UpdateState::Disabled => "disabled".to_string(),
-            UpdateState::NoRelease => "no release".to_string(),
-            UpdateState::Current(version) => format!("v{version} · latest"),
-            UpdateState::Newer(version) => format!("v{version} · new"),
-        }
-    }
-}
-
 #[derive(Clone)]
 enum Source {
     Category(Category),
@@ -403,23 +391,14 @@ impl App {
     // ---------------------------------------------------------------- screens
 
     fn home(&mut self, term: &mut Term) -> Result<Nav> {
-        let mut list = List::new(vec![
-            Item::new(Kind::Action, "browse", "Browse categories")
-                .meta("categories")
-                .detail("Pick a category and page through its newest videos."),
-            Item::new(Kind::Action, "update", "Check for updates")
-                .meta("updates")
-                .detail("Compare this build with the latest published release."),
-            Item::new(Kind::Action, "quit", "Quit")
-                .meta("q")
-                .detail("Close ph-tui and restore the terminal."),
-        ]);
+        let mut list = List::new(vec![Item::new(Kind::Action, "browse", "Browse categories")
+            .meta("b")
+            .detail("Pick a category and page through its newest videos.")]);
         self.thumb.reset();
 
         loop {
             self.poll_update();
             self.poll_theme();
-            list.items[1].meta = self.update.short();
             term.draw(|frame| {
                 self.render_list_page(
                     frame,
@@ -427,7 +406,7 @@ impl App {
                     "Start",
                     &mut list,
                     false,
-                    &[("/", "search"), ("1-2", "jump"), ("q", "quit")],
+                    &[("/", "search"), ("b", "browse"), ("q", "quit")],
                 );
             })?;
 
@@ -439,15 +418,9 @@ impl App {
                 Key::Down => list.down(),
                 Key::Home => list.home(),
                 Key::End => list.end(),
-                Key::Enter => {
-                    return Ok(match list.selected().map(|item| item.key.as_str()) {
-                        Some("update") => Nav::Update,
-                        Some("quit") => Nav::Quit,
-                        _ => Nav::Browse,
-                    })
-                }
+                Key::Enter => return Ok(Nav::Browse),
                 Key::Char('/') => return Ok(Nav::Search),
-                Key::Char('1') => return Ok(Nav::Browse),
+                Key::Char('b') | Key::Char('1') => return Ok(Nav::Browse),
                 Key::Char('2') | Key::Char('u') => return Ok(Nav::Update),
                 Key::Char('q') => return Ok(Nav::Quit),
                 Key::Ctrl('c') => self.quit(),
@@ -895,10 +868,8 @@ impl App {
         self.render_details(frame, details_area, selected);
 
         render_rule(frame, chunks[3], &theme);
-        let status = format!("{} items · {} shown", list.items.len(), list.matches.len());
-        self.render_status(frame, chunks[4], &status);
-        render_rule(frame, chunks[5], &theme);
 
+        let status = format!("{} items · {} shown", list.items.len(), list.matches.len());
         let mut hints: Vec<(&str, &str)> = vec![("↑↓", "move"), ("enter", "select")];
         hints.extend_from_slice(extra);
         if filterable {
@@ -906,7 +877,7 @@ impl App {
         }
         hints.push(("esc", "back"));
         hints.push(("ctrl-c", "quit"));
-        self.render_footer(frame, chunks[6], &hints);
+        self.render_status(frame, chunks[4], &status, &hints);
     }
 
     fn render_list_panel(
@@ -1192,9 +1163,10 @@ impl App {
         );
     }
 
-    fn render_status(&self, frame: &mut Frame, area: Rect, fallback: &str) {
+    /// Status on the left, keybind guide on the right — one utui-style row.
+    fn render_status(&self, frame: &mut Frame, area: Rect, fallback: &str, hints: &[(&str, &str)]) {
         let theme = self.theme;
-        let line = if let Some(toast) = self.active_toast() {
+        let status = if let Some(toast) = self.active_toast() {
             let color = match toast.tone {
                 Tone::Info => theme.warn,
                 Tone::Success => theme.success,
@@ -1210,29 +1182,13 @@ impl App {
                 Span::styled(fallback.to_string(), Style::default().fg(theme.faint)),
             ])
         };
-        frame.render_widget(Paragraph::new(line), area);
-    }
 
-    fn render_footer(&self, frame: &mut Frame, area: Rect, hints: &[(&str, &str)]) {
-        let theme = self.theme;
-        let mut spans = vec![Span::raw(" ")];
-        for (index, (key, action)) in hints.iter().enumerate() {
-            if index > 0 {
-                spans.push(Span::styled("  ·  ", Style::default().fg(theme.faint)));
-            }
-            spans.push(Span::styled(
-                (*key).to_string(),
-                Style::default()
-                    .fg(theme.accent_soft)
-                    .add_modifier(Modifier::BOLD),
-            ));
-            spans.push(Span::raw(" "));
-            spans.push(Span::styled(
-                (*action).to_string(),
-                Style::default().fg(theme.dim),
-            ));
-        }
-        frame.render_widget(Paragraph::new(Line::from(spans)), area);
+        let guide = hints_line(&theme, hints);
+        let guide_width = (guide.width() as u16 + 1).min(area.width);
+        let chunks =
+            Layout::horizontal([Constraint::Min(1), Constraint::Length(guide_width)]).split(area);
+        frame.render_widget(Paragraph::new(status), chunks[0]);
+        frame.render_widget(Paragraph::new(guide).right_aligned(), chunks[1]);
     }
 
     fn render_input(
@@ -1322,11 +1278,10 @@ impl App {
         self.render_details(frame, details, Some(&tips));
 
         render_rule(frame, chunks[3], &theme);
-        self.render_status(frame, chunks[4], "type a query · enter to search");
-        render_rule(frame, chunks[5], &theme);
-        self.render_footer(
+        self.render_status(
             frame,
-            chunks[6],
+            chunks[4],
+            "type a query · enter to search",
             &[
                 ("enter", "search"),
                 ("←→", "edit"),
@@ -1395,9 +1350,12 @@ impl App {
         frame.render_widget(Paragraph::new(Text::from(lines)), inner);
 
         render_rule(frame, chunks[3], &theme);
-        self.render_status(frame, chunks[4], "request in flight");
-        render_rule(frame, chunks[5], &theme);
-        self.render_footer(frame, chunks[6], &[("esc", "cancel"), ("ctrl-c", "quit")]);
+        self.render_status(
+            frame,
+            chunks[4],
+            "request in flight",
+            &[("esc", "cancel"), ("ctrl-c", "quit")],
+        );
     }
 
     fn render_update(&mut self, frame: &mut Frame, tick: usize) {
@@ -1476,33 +1434,29 @@ impl App {
         );
 
         render_rule(frame, chunks[3], &theme);
-        self.render_status(frame, chunks[4], "checks happen once per run");
-        render_rule(frame, chunks[5], &theme);
-        self.render_footer(
+        self.render_status(
             frame,
-            chunks[6],
+            chunks[4],
+            "checks happen once per run",
             &[("r", "recheck"), ("esc", "back"), ("ctrl-c", "quit")],
         );
     }
 }
 
-fn chrome_layout(area: Rect) -> [Rect; 7] {
+fn chrome_layout(area: Rect) -> [Rect; 5] {
     let chunks = Layout::vertical([
         Constraint::Length(1), // header
-        Constraint::Length(1), // rule
+        Constraint::Length(1), // top rule
         Constraint::Min(2),    // body
-        Constraint::Length(1), // rule
-        Constraint::Length(1), // status
-        Constraint::Length(1), // rule
-        Constraint::Length(1), // footer
+        Constraint::Length(1), // bottom rule
+        Constraint::Length(1), // status + keybind guide
     ])
     .split(area);
-    [
-        chunks[0], chunks[1], chunks[2], chunks[3], chunks[4], chunks[5], chunks[6],
-    ]
+    [chunks[0], chunks[1], chunks[2], chunks[3], chunks[4]]
 }
 
-/// One of the three hairline dividers in the minimal chrome.
+/// The two hairline dividers in the minimal chrome: one under the header,
+/// one above the status/keybind row.
 fn render_rule(frame: &mut Frame, area: Rect, theme: &Theme) {
     if area.width == 0 || area.height == 0 {
         return;
@@ -1514,6 +1468,27 @@ fn render_rule(frame: &mut Frame, area: Rect, theme: &Theme) {
         ))),
         area,
     );
+}
+
+fn hints_line(theme: &Theme, hints: &[(&str, &str)]) -> Line<'static> {
+    let mut spans = vec![Span::raw(" ")];
+    for (index, (key, action)) in hints.iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::styled("  ·  ", Style::default().fg(theme.faint)));
+        }
+        spans.push(Span::styled(
+            (*key).to_string(),
+            Style::default()
+                .fg(theme.accent_soft)
+                .add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(
+            (*action).to_string(),
+            Style::default().fg(theme.dim),
+        ));
+    }
+    Line::from(spans)
 }
 
 fn body_layout(area: Rect) -> (Rect, Rect) {
@@ -1530,7 +1505,7 @@ fn body_layout(area: Rect) -> (Rect, Rect) {
 
 fn panel(theme: &Theme, title: &str) -> Block<'static> {
     // No box: the title sits on its own row, with content starting below it.
-    // The only lines in the UI are the three chrome rules.
+    // The only lines in the UI are the two chrome rules.
     Block::default().title(Line::from(Span::styled(
         format!(" {title} "),
         Style::default()
@@ -1715,7 +1690,7 @@ mod tests {
     }
 
     #[test]
-    fn minimal_chrome_has_three_rules_and_no_boxes() {
+    fn minimal_chrome_has_two_rules_and_no_boxes() {
         let mut app = App::headless();
         let mut list = List::new(vec![Item::new(Kind::Video, "abc", "Alpha")]);
         let screen = render(&mut app, &mut list);
@@ -1726,7 +1701,7 @@ mod tests {
             .lines()
             .filter(|line| !line.is_empty() && line.chars().all(|ch| ch == '─'))
             .count();
-        assert_eq!(rules, 3, "expected three chrome rules: {screen}");
+        assert_eq!(rules, 2, "expected two chrome rules: {screen}");
     }
 
     #[test]

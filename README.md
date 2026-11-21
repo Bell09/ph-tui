@@ -18,16 +18,14 @@ Rust. The interface is built with `ratatui`, previews use `ratatui-image`, and
                                            enter watch · ctrl-d download
                                                                  13 / 13
 ────────────────────────────────────────────────────────────────────────────────
- · 13 items · 13 shown
-────────────────────────────────────────────────────────────────────────────────
- ↑↓ move  ·  enter select  ·  ctrl-d download  ·  ctrl-o browser  ·  type filter
+ · 13 items · 13 shown      ↑↓ move · enter select · ctrl-d download · esc back
 ```
 
 ## Features
 
 - **Native TUI** — header, split browser, details pane, status line and key hints
-- **Minimal chrome** — no panel boxes; three single-line rules separate the
-  header, status row and footer
+- **Minimal chrome** — no panel boxes; two single-line rules frame the content,
+  with status and keybind guide sharing one utui-style row
 - **Inline previews** — kitty, sixel or iTerm2 graphics, with unicode half-block
   fallback on terminals that support neither
 - **Fast filtering** — fuzzy match with highlighted characters, paging and a
@@ -111,14 +109,16 @@ Or use the helper script, which installs to `/usr/local/bin` by default:
 
 ## Usage
 
-Run `ph-tui` in a terminal. The home screen offers:
+Run `ph-tui` in a terminal. The home screen has one item — Browse categories:
 
 | Key | Action |
 | --- | --- |
+| `b` / `1` | Browse categories |
 | `/` | Search videos |
-| `1` | Browse categories |
-| `2` / `u` | Check for updates |
 | `q` | Quit |
+
+`2` / `u` still check for updates from the home screen, but the update check is
+no longer a menu item.
 
 ### Lists
 
