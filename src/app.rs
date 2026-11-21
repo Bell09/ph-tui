@@ -1168,11 +1168,12 @@ impl App {
                 ThumbState::Idle | ThumbState::Failed => {}
             }
             if let Some(rows) = preview_height {
+                // No gap between the image and its caption: compact.
                 body = Rect::new(
                     inner.x,
-                    inner.y + rows + 1,
+                    inner.y + rows,
                     inner.width,
-                    inner.height.saturating_sub(rows + 1),
+                    inner.height.saturating_sub(rows),
                 );
             }
         }
@@ -1197,7 +1198,6 @@ impl App {
                         .fg(theme.accent_soft)
                         .add_modifier(Modifier::BOLD),
                 )));
-                lines.push(Line::from(""));
 
                 let width = body.width.saturating_sub(1) as usize;
                 for chunk in tui::wrap(&item.label, width) {
@@ -1208,7 +1208,6 @@ impl App {
                 }
 
                 if !item.meta.is_empty() {
-                    lines.push(Line::from(""));
                     lines.push(Line::from(Span::styled(
                         item.meta.clone(),
                         Style::default().fg(theme.faint),
@@ -1216,7 +1215,6 @@ impl App {
                 }
 
                 if !item.detail.is_empty() {
-                    lines.push(Line::from(""));
                     for chunk in tui::wrap(&item.detail, width) {
                         lines.push(Line::from(Span::styled(
                             chunk,
@@ -1226,7 +1224,6 @@ impl App {
                 }
 
                 if item.kind == Kind::Video {
-                    lines.push(Line::from(""));
                     lines.push(Line::from(vec![
                         Span::styled(
                             "enter",
@@ -1668,12 +1665,14 @@ fn hints_line(theme: &Theme, hints: &[(&str, &str)]) -> Line<'static> {
 
 fn body_layout(area: Rect) -> (Rect, Rect) {
     if area.width >= 100 {
-        let chunks = Layout::horizontal([Constraint::Percentage(58), Constraint::Percentage(42)])
+        // Give the preview pane a larger share so the image is noticeably
+        // bigger while the list keeps most of the width.
+        let chunks = Layout::horizontal([Constraint::Percentage(52), Constraint::Percentage(48)])
             .split(area);
         (chunks[0], chunks[1])
     } else {
         let chunks =
-            Layout::vertical([Constraint::Percentage(60), Constraint::Percentage(40)]).split(area);
+            Layout::vertical([Constraint::Percentage(55), Constraint::Percentage(45)]).split(area);
         (chunks[0], chunks[1])
     }
 }
@@ -1782,13 +1781,15 @@ fn row_line(
 }
 
 fn preview_rows(inner: Rect) -> u16 {
-    let max = inner.height.saturating_sub(6);
+    // Reserve only a compact strip for the title, metadata and key hint.
+    let max = inner.height.saturating_sub(4);
     if max < 4 {
         return 0;
     }
-    // Terminal cells are roughly twice as tall as they are wide.
+    // Terminal cells are roughly twice as tall as they are wide, so this is
+    // the row count for a 16:9 image spanning the pane width.
     let by_width = (inner.width as u32 * 9 / 32) as u16;
-    by_width.clamp(4, max).min(16)
+    by_width.clamp(4, max).min(24)
 }
 
 fn render_too_small(frame: &mut Frame, theme: &Theme, area: Rect) {
@@ -1937,6 +1938,16 @@ mod tests {
             screen.contains("type to filter") || screen.contains("a"),
             "{screen}"
         );
+    }
+
+    #[test]
+    fn preview_uses_more_of_the_details_pane() {
+        // A 96-column pane should get a 24-row 16:9 preview, not the old
+        // 16-row cap, and only four rows are reserved for the caption.
+        assert_eq!(preview_rows(Rect::new(0, 0, 96, 48)), 24);
+        assert_eq!(preview_rows(Rect::new(0, 0, 96, 28)), 24);
+        // Too short for a preview plus caption: leave it to the text.
+        assert_eq!(preview_rows(Rect::new(0, 0, 96, 7)), 0);
     }
 
     #[test]
