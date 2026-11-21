@@ -152,6 +152,28 @@ pub fn xhamster_search(query: &str, page: u32) -> Result<Vec<Video>> {
 
 const BASE_XHAMSTER: &str = "https://xhamster.desi";
 
+/// Videos from a channel/uploader page. PornHub pages paginate with `?page=N`;
+/// xHamster creator, channel, and user pages use a `/N` path suffix.
+pub fn channel_videos(url: &str, page: u32) -> Result<Vec<Video>> {
+    let html = if url.starts_with(BASE_XHAMSTER) {
+        let base = url.trim_end_matches('/');
+        let page_url = if page > 1 {
+            format!("{base}/{page}")
+        } else {
+            base.to_string()
+        };
+        get_html(&page_url)?
+    } else {
+        get_html(&format!("{url}?page={page}"))?
+    };
+
+    if url.starts_with(BASE_XHAMSTER) {
+        Ok(xhamster_videos_from_html(&html))
+    } else {
+        Ok(videos_from_html(&html))
+    }
+}
+
 /// Extract videos from xHamster listing HTML.
 ///
 /// A video is rendered as two anchors that point at the same watch URL: the
@@ -213,10 +235,15 @@ fn collect_xhamster_videos(
             continue;
         };
         let preview = preview_from_link(&link, images);
+        let channel = channel_from_link(&link, Site::Xhamster);
 
         if let Some(&index) = positions.get(&watch_url) {
             if videos[index].preview.is_none() {
                 videos[index].preview = preview;
+            }
+            if videos[index].channel_url.is_none() {
+                videos[index].channel = channel.as_ref().map(|(name, _)| name.clone());
+                videos[index].channel_url = channel.map(|(_, url)| url);
             }
             continue;
         }
@@ -229,6 +256,8 @@ fn collect_xhamster_videos(
             title,
             preview,
             watch_url: Some(watch_url),
+            channel: channel.as_ref().map(|(name, _)| name.clone()),
+            channel_url: channel.map(|(_, url)| url),
         });
     }
 }
@@ -343,12 +372,17 @@ fn collect_videos(
         };
         let title = decode_entities(element.value().attr("title").unwrap_or("").trim());
         let preview = preview_from_link(&element, images);
+        let channel = channel_from_link(&element, Site::Pornhub);
 
         if let Some(&index) = positions.get(&viewkey) {
             // The title anchor often follows the thumbnail anchor; keep the
-            // first title but fill in an image discovered later.
+            // first title but fill in an image or channel discovered later.
             if videos[index].preview.is_none() {
                 videos[index].preview = preview;
+            }
+            if videos[index].channel_url.is_none() {
+                videos[index].channel = channel.as_ref().map(|(name, _)| name.clone());
+                videos[index].channel_url = channel.map(|(_, url)| url);
             }
             continue;
         }
@@ -362,7 +396,116 @@ fn collect_videos(
             title,
             preview,
             watch_url: None,
+            channel: channel.as_ref().map(|(name, _)| name.clone()),
+            channel_url: channel.map(|(_, url)| url),
         });
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Site {
+    Pornhub,
+    Xhamster,
+}
+
+/// Find the uploader link inside the listing card that contains `link`.
+/// PornHub wraps each result in `li.videoblock`; xHamster uses a div with the
+/// `video-thumb` / `thumb-list__item` classes.
+fn channel_from_link(link: &ElementRef<'_>, site: Site) -> Option<(String, String)> {
+    let anchors = Selector::parse("a[href]").expect("static selector is valid");
+    let container = link
+        .ancestors()
+        .filter_map(ElementRef::wrap)
+        .take(10)
+        .find(|element| match site {
+            Site::Pornhub => {
+                element.value().name() == "li"
+                    && element
+                        .value()
+                        .classes()
+                        .any(|class| class == "videoblock" || class == "videoBox")
+            }
+            Site::Xhamster => {
+                element.value().name() == "div"
+                    && element
+                        .value()
+                        .classes()
+                        .any(|class| class == "video-thumb" || class == "thumb-list__item")
+            }
+        })?;
+
+    for anchor in container.select(&anchors) {
+        let Some(href) = anchor.value().attr("href") else {
+            continue;
+        };
+        let candidate = match site {
+            Site::Pornhub => pornhub_channel_url(href),
+            Site::Xhamster => xhamster_channel_url(href),
+        };
+        let Some(url) = candidate else {
+            continue;
+        };
+        let name = anchor_name(&anchor);
+        if !name.is_empty() {
+            return Some((name, url));
+        }
+    }
+    None
+}
+
+fn anchor_name(anchor: &ElementRef<'_>) -> String {
+    let title = anchor.value().attr("title").unwrap_or("").trim();
+    let raw = if title.is_empty() {
+        anchor.text().collect::<String>()
+    } else {
+        title.to_string()
+    };
+    decode_entities(raw.trim())
+}
+
+fn href_path(href: &str) -> Option<String> {
+    let href = href.trim();
+    if let Some(rest) = href
+        .strip_prefix("http://")
+        .or_else(|| href.strip_prefix("https://"))
+    {
+        let (_, path) = rest.split_once('/')?;
+        Some(format!("/{path}"))
+    } else if href.starts_with('/') {
+        Some(href.to_string())
+    } else {
+        None
+    }
+}
+
+fn clean_path(path: &str) -> &str {
+    let end = path.find(['?', '#']).unwrap_or(path.len());
+    &path[..end]
+}
+
+fn pornhub_channel_url(href: &str) -> Option<String> {
+    let raw_path = href_path(href)?;
+    let path = clean_path(&raw_path);
+    let prefix = ["/model/", "/channels/", "/user/", "/pornstar/"]
+        .into_iter()
+        .find(|prefix| path.starts_with(prefix))?;
+    let slug = path[prefix.len()..].split('/').next()?;
+    if slug.is_empty() {
+        return None;
+    }
+    Some(format!("https://www.pornhub.com{prefix}{slug}/videos"))
+}
+
+fn xhamster_channel_url(href: &str) -> Option<String> {
+    let raw_path = href_path(href)?;
+    let path = clean_path(&raw_path).trim_end_matches('/');
+    let segments: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
+    match segments.as_slice() {
+        [kind @ ("creators" | "channels"), slug] => Some(format!("{BASE_XHAMSTER}/{kind}/{slug}")),
+        ["users", slug] | ["users", slug, "videos"] => {
+            Some(format!("{BASE_XHAMSTER}/users/{slug}/videos"))
+        }
+        _ => None,
     }
 }
 
@@ -513,6 +656,39 @@ mod tests {
     }
 
     #[test]
+    fn extracts_channel_links_from_pornhub_cards() {
+        let html = r#"
+            <ul id="videoSearchResult">
+              <li class="videoblock videoBox">
+                <a href="/view_video.php?viewkey=abc" title="First video">
+                  <img data-image="https://cdn.example/abc.jpg">
+                </a>
+                <a href="/model/jane-doe" title="Jane Doe">Jane Doe</a>
+                <a href="/view_video.php?viewkey=abc" title="First video">First video</a>
+              </li>
+              <li class="videoblock videoBox">
+                <a href="/view_video.php?viewkey=def" title="Second video">
+                  <img data-image="https://cdn.example/def.jpg">
+                </a>
+                <a href="/channels/fake-hostel" class="bolded">Fake Hostel</a>
+              </li>
+            </ul>
+        "#;
+        let videos = videos_from_html(html);
+        assert_eq!(videos.len(), 2);
+        assert_eq!(videos[0].channel.as_deref(), Some("Jane Doe"));
+        assert_eq!(
+            videos[0].channel_url.as_deref(),
+            Some("https://www.pornhub.com/model/jane-doe/videos")
+        );
+        assert_eq!(videos[1].channel.as_deref(), Some("Fake Hostel"));
+        assert_eq!(
+            videos[1].channel_url.as_deref(),
+            Some("https://www.pornhub.com/channels/fake-hostel/videos")
+        );
+    }
+
+    #[test]
     fn thumbnails_are_read_from_listing_markup() {
         let html = r#"
             <a href="/view_video.php?viewkey=one" title="One">
@@ -556,12 +732,16 @@ mod tests {
                 <a data-role="thumb-link"
                    href="https://xhamster.desi/videos/first-video-xhABC123"
                    title="First &amp; best">First &amp; best</a>
+                <a class="video-uploader__name"
+                   href="https://xhamster.desi/creators/first-creator">First Creator</a>
               </div>
               <div class="video-thumb">
                 <a data-role="thumb-link" href="/videos/second-video-xhDEF456"
                    title="Second video">
                   <img src="https://cdn.example/second.jpg">
                 </a>
+                <a class="video-uploader__name"
+                   href="https://xhamster.desi/creators/second-creator">Second Creator</a>
               </div>
               <a data-role="thumb-link" href="https://xhamster.desi/categories/big-tits"
                  title="Not a video"></a>
@@ -579,6 +759,11 @@ mod tests {
             videos[0].watch_url.as_deref(),
             Some("https://xhamster.desi/videos/first-video-xhABC123")
         );
+        assert_eq!(videos[0].channel.as_deref(), Some("First Creator"));
+        assert_eq!(
+            videos[0].channel_url.as_deref(),
+            Some("https://xhamster.desi/creators/first-creator")
+        );
         assert_eq!(videos[1].viewkey, "xhDEF456");
         assert_eq!(videos[1].title, "Second video");
         assert_eq!(
@@ -588,6 +773,35 @@ mod tests {
         assert_eq!(
             videos[1].watch_url.as_deref(),
             Some("https://xhamster.desi/videos/second-video-xhDEF456")
+        );
+        assert_eq!(videos[1].channel.as_deref(), Some("Second Creator"));
+        assert_eq!(
+            videos[1].channel_url.as_deref(),
+            Some("https://xhamster.desi/creators/second-creator")
+        );
+    }
+
+    #[test]
+    fn xhamster_channel_urls_cover_every_uploader_kind() {
+        assert_eq!(
+            xhamster_channel_url("https://xhamster.desi/creators/priyaqueen"),
+            Some("https://xhamster.desi/creators/priyaqueen".to_string())
+        );
+        assert_eq!(
+            xhamster_channel_url("/channels/jerky-girls"),
+            Some("https://xhamster.desi/channels/jerky-girls".to_string())
+        );
+        assert_eq!(
+            xhamster_channel_url("https://xhamster.desi/users/asian__sensation/videos"),
+            Some("https://xhamster.desi/users/asian__sensation/videos".to_string())
+        );
+        assert_eq!(
+            xhamster_channel_url("/users/asian__sensation"),
+            Some("https://xhamster.desi/users/asian__sensation/videos".to_string())
+        );
+        assert_eq!(
+            xhamster_channel_url("https://xhamster.desi/users/xhamster/blog"),
+            None
         );
     }
 
@@ -701,6 +915,10 @@ mod tests {
             videos.iter().any(|video| video.preview.is_some()),
             "listing page carried no thumbnails"
         );
+        assert!(
+            videos.iter().any(|video| video.channel_url.is_some()),
+            "listing page carried no channel links"
+        );
         // Regression: title keyword filtering used to drop every `pov` hit.
         let pov = search_videos("pov", 1).expect("pov search request");
         assert!(!pov.is_empty(), "pov search returned nothing");
@@ -717,11 +935,34 @@ mod tests {
             "xHamster listing carried no thumbnails"
         );
         assert!(
+            videos.iter().any(|video| video.channel_url.is_some()),
+            "xHamster listing carried no creator links"
+        );
+        assert!(
             videos.iter().all(|video| video
                 .watch_url
                 .as_deref()
                 .is_some_and(|url| url.starts_with("https://xhamster.desi/videos/"))),
             "xHamster results must carry full watch URLs"
+        );
+    }
+
+    /// Hits the real site; run with `cargo test -- --ignored`.
+    #[test]
+    #[ignore]
+    fn live_channel_videos() {
+        let pornhub = channel_videos("https://www.pornhub.com/model/sofi-becker/videos", 1)
+            .expect("PornHub channel request");
+        assert!(!pornhub.is_empty(), "PornHub channel returned nothing");
+
+        let xhamster = channel_videos("https://xhamster.desi/creators/renatinharj", 1)
+            .expect("xHamster creator request");
+        assert!(!xhamster.is_empty(), "xHamster creator returned nothing");
+        assert!(
+            xhamster
+                .iter()
+                .any(|video| video.watch_url.as_deref().is_some()),
+            "xHamster creator results must carry watch URLs"
         );
     }
 

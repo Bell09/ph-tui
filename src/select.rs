@@ -22,6 +22,10 @@ pub struct Item {
     pub image: Option<String>,
     /// Full watch URL (used by sources with URL-based identifiers, e.g. xHamster).
     pub url: Option<String>,
+    /// Uploader/channel name, when the source exposes one.
+    pub channel: Option<String>,
+    /// Channel video listing URL, used by the `c` shortcut.
+    pub channel_url: Option<String>,
 }
 
 impl Item {
@@ -34,6 +38,8 @@ impl Item {
             detail: String::new(),
             image: None,
             url: None,
+            channel: None,
+            channel_url: None,
         }
     }
 
@@ -54,6 +60,12 @@ impl Item {
 
     pub fn url(mut self, url: Option<String>) -> Self {
         self.url = url;
+        self
+    }
+
+    pub fn channel(mut self, name: Option<String>, url: Option<String>) -> Self {
+        self.channel = name;
+        self.channel_url = url;
         self
     }
 }

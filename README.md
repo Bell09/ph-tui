@@ -34,6 +34,7 @@ Rust. The interface is built with `ratatui`, previews use `ratatui-image`, and
   and Top Rated; each feed loads real videos with inline previews
 - **Categories and search** — fetch from the site directly, page through results
 - **xHamster search** — press `x` from home to search xHamster and play its results
+- **Channel browsing** — press `c` on a video to open its uploader/channel in the TUI
 - **Playback** — hand the watch page to `mpv`, which resolves the stream through
   `yt-dlp`; playback is always capped at 320p
 - **Downloads** — pick best / 720p / 480p / 360p, written to `~/Videos/ph-tui`
@@ -124,7 +125,7 @@ Run `ph-tui` in a terminal. The home screen opens straight into the
    Another recommendation                   #def456  VIDEO
    ...                                               A recommended video
 ────────────────────────────────────────────────────────────────────────────────
- · N videos · N shown · page 1    ↑↓ move · enter watch · tab feed · / search · x xhamster · b browse · q quit
+ · N videos · N shown · page 1    ↑↓ move · enter watch · tab feed · c channel · / search · x xhamster · b browse · q quit
 ```
 
 | Key | Action |
@@ -134,6 +135,7 @@ Run `ph-tui` in a terminal. The home screen opens straight into the
 | `↑` / `↓`, `PgUp` / `PgDn` | Move through the feed / change page |
 | `Enter` | Watch the selected video; `>>> Next page` works on ordered feeds |
 | `Ctrl-D` / `Ctrl-O` | Download / open the selected video in a browser |
+| `c` | Open the selected video's uploader/channel |
 | `b` / `1` | Browse categories |
 | `/` | Search videos |
 | `x` | xHamster search |
@@ -152,6 +154,7 @@ check for updates from the home screen, but the update check is not in the bar.
 | type | Filter the list |
 | `Backspace`, `Ctrl-W`, `Ctrl-U` | Edit the filter |
 | `Enter` | Select |
+| `c` | Open the selected video's uploader/channel |
 | `Esc` | Back |
 | `Ctrl-C` | Quit anywhere |
 

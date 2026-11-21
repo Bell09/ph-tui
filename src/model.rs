@@ -68,6 +68,10 @@ pub struct Video {
     /// Full watch URL for sites that don't use viewkey-based URLs (e.g. xHamster).
     /// When None, the standard watch_url(viewkey) is used.
     pub watch_url: Option<String>,
+    /// Uploader/channel name shown on the listing page.
+    pub channel: Option<String>,
+    /// Channel video listing URL, used by the `c` shortcut.
+    pub channel_url: Option<String>,
 }
 
 /// Build the watch page URL for a bare viewkey.

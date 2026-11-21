@@ -48,6 +48,7 @@ enum Nav {
 
 enum UiEvent {
     Select(usize),
+    Channel(usize),
     Back,
     Ctrl(char),
 }
@@ -78,6 +79,7 @@ enum Source {
     Category(Category),
     Search(String),
     Xhamster { query: String },
+    Channel { name: String, url: String },
 }
 
 impl Source {
@@ -86,6 +88,7 @@ impl Source {
             Source::Category(category) => format!("Categories · {}", category.name),
             Source::Search(query) => format!("Search · {query}"),
             Source::Xhamster { query } => format!("XHamster · {query}"),
+            Source::Channel { name, .. } => format!("Channel · {name}"),
         }
     }
 
@@ -94,6 +97,7 @@ impl Source {
             Source::Category(_) => "Videos",
             Source::Search(_) => "Results",
             Source::Xhamster { .. } => "XHamster Results",
+            Source::Channel { .. } => "Channel Videos",
         }
     }
 
@@ -102,6 +106,7 @@ impl Source {
             Source::Category(category) => http::category_videos(&category.id, page),
             Source::Search(query) => http::search_videos(query, page),
             Source::Xhamster { query } => http::xhamster_search(query, page),
+            Source::Channel { url, .. } => http::channel_videos(url, page),
         }
     }
 }
@@ -432,6 +437,7 @@ impl App {
                         )
                         .image(video.preview.clone())
                         .url(video.watch_url.clone())
+                        .channel(video.channel.clone(), video.channel_url.clone())
                 })
                 .collect();
 
@@ -478,6 +484,15 @@ impl App {
                             FeedKind::ALL.len() - 1
                         };
                         next = Some((FeedKind::ALL[(index + step) % FeedKind::ALL.len()], 1));
+                    }
+                    Key::Char('c') => {
+                        let Some(index) = list.selected_index() else {
+                            continue;
+                        };
+                        let item = list.items[index].clone();
+                        if item.kind == Kind::Video {
+                            self.open_channel(term, &item)?;
+                        }
                     }
                     Key::Char('/') => return Ok(Nav::Search),
                     Key::Char('b') | Key::Char('1') => return Ok(Nav::Browse),
@@ -557,6 +572,7 @@ impl App {
             match self.list_screen(term, "Categories", "Browse", &mut list, true, &[])? {
                 UiEvent::Back => return Ok(()),
                 UiEvent::Ctrl(_) => {}
+                UiEvent::Channel(_) => {}
                 UiEvent::Select(index) => {
                     let item = list.items[index].clone();
                     let category = Category {
@@ -634,6 +650,7 @@ impl App {
                         .detail("Enter streams the video, ctrl-d downloads it, ctrl-o opens it in a browser.")
                         .image(video.preview.clone())
                         .url(video.watch_url.clone())
+                        .channel(video.channel.clone(), video.channel_url.clone())
                 })
                 .collect();
 
@@ -664,6 +681,10 @@ impl App {
                     UiEvent::Ctrl('d') => self.download_selected(term, &list)?,
                     UiEvent::Ctrl('o') => self.browser_selected(&list),
                     UiEvent::Ctrl(_) => {}
+                    UiEvent::Channel(index) => {
+                        let item = list.items[index].clone();
+                        self.open_channel(term, &item)?;
+                    }
                     UiEvent::Select(index) => {
                         let item = &list.items[index];
                         match item.kind {
@@ -713,8 +734,23 @@ impl App {
                     }
                 }
                 UiEvent::Ctrl(_) => {}
+                UiEvent::Channel(_) => {}
             }
         }
+    }
+
+    /// Open the selected video's uploader/channel as another browsable feed.
+    /// Returning from the nested list screen lands back where `c` was pressed.
+    fn open_channel(&mut self, term: &mut Term, item: &Item) -> Result<()> {
+        let Some(url) = item.channel_url.clone() else {
+            self.set_toast("This video has no channel link", Tone::Info);
+            return Ok(());
+        };
+        let name = item
+            .channel
+            .clone()
+            .unwrap_or_else(|| "Channel".to_string());
+        self.browse_results(term, Source::Channel { name, url })
     }
 
     fn download_selected(&mut self, term: &mut Term, list: &List) -> Result<()> {
@@ -848,6 +884,16 @@ impl App {
                 Key::Home => list.home(),
                 Key::End => list.end(),
                 Key::Backspace => list.backspace(),
+                Key::Char('c')
+                    if list.selected().is_some_and(|item| {
+                        item.kind == Kind::Video && item.channel_url.is_some()
+                    }) =>
+                {
+                    let index = list
+                        .selected_index()
+                        .expect("a selected item always has an index");
+                    return Ok(UiEvent::Channel(index));
+                }
                 Key::Char(ch) if filterable && !ch.is_control() => list.push_char(ch),
                 _ => {}
             }
@@ -991,6 +1037,13 @@ impl App {
 
         let status = format!("{} items · {} shown", list.items.len(), list.matches.len());
         let mut hints: Vec<(&str, &str)> = vec![("↑↓", "move"), ("enter", "select")];
+        if list
+            .items
+            .iter()
+            .any(|item| item.kind == Kind::Video && item.channel_url.is_some())
+        {
+            hints.push(("c", "channel"));
+        }
         hints.extend_from_slice(extra);
         if filterable {
             hints.push(("type", "filter"));
@@ -1670,11 +1723,12 @@ fn render_feed_bar(frame: &mut Frame, area: Rect, active: FeedKind, theme: &Them
 }
 
 /// Home keybind guide shown on the bottom status row.
-fn home_hints() -> [(&'static str, &'static str); 7] {
+fn home_hints() -> [(&'static str, &'static str); 8] {
     [
         ("↑↓", "move"),
         ("enter", "watch"),
         ("tab", "feed"),
+        ("c", "channel"),
         ("/", "search"),
         ("x", "xhamster"),
         ("b", "browse"),
@@ -1927,6 +1981,7 @@ mod tests {
         }
         assert!(screen.contains("Browse categories"), "{screen}");
         assert!(screen.contains("A recommended video"), "{screen}");
+        assert!(screen.contains("c channel"), "missing c hint: {screen}");
         assert!(screen.contains("x xhamster"), "missing x hint: {screen}");
     }
 
