@@ -20,6 +20,8 @@ pub struct Item {
     pub detail: String,
     /// Preview image URL, when the source already knows one.
     pub image: Option<String>,
+    /// Full watch URL (used by sources with URL-based identifiers, e.g. xHamster).
+    pub url: Option<String>,
 }
 
 impl Item {
@@ -31,6 +33,7 @@ impl Item {
             meta: String::new(),
             detail: String::new(),
             image: None,
+            url: None,
         }
     }
 
@@ -46,6 +49,11 @@ impl Item {
 
     pub fn image(mut self, image: Option<String>) -> Self {
         self.image = image;
+        self
+    }
+
+    pub fn url(mut self, url: Option<String>) -> Self {
+        self.url = url;
         self
     }
 }

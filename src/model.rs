@@ -65,6 +65,9 @@ pub struct Video {
     /// Listing pages usually carry a thumbnail, which makes the preview pane
     /// instant instead of requiring a second request to the watch page.
     pub preview: Option<String>,
+    /// Full watch URL for sites that don't use viewkey-based URLs (e.g. xHamster).
+    /// When None, the standard watch_url(viewkey) is used.
+    pub watch_url: Option<String>,
 }
 
 /// Build the watch page URL for a bare viewkey.

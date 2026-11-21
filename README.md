@@ -33,6 +33,7 @@ Rust. The interface is built with `ratatui`, previews use `ratatui-image`, and
 - **Home feeds** — a feed bar with Recommendations, Hottest, Most Viewed, Newest
   and Top Rated; each feed loads real videos with inline previews
 - **Categories and search** — fetch from the site directly, page through results
+- **xHamster search** — press `x` from home to search xHamster and play its results
 - **Playback** — hand the watch page to `mpv`, which resolves the stream through
   `yt-dlp`; playback is always capped at 320p
 - **Downloads** — pick best / 720p / 480p / 360p, written to `~/Videos/ph-tui`
@@ -123,7 +124,7 @@ Run `ph-tui` in a terminal. The home screen opens straight into the
    Another recommendation                   #def456  VIDEO
    ...                                               A recommended video
 ────────────────────────────────────────────────────────────────────────────────
- · N videos · N shown · page 1    ↑↓ move · enter watch · tab feed · / search · b browse · q quit
+ · N videos · N shown · page 1    ↑↓ move · enter watch · tab feed · / search · x xhamster · b browse · q quit
 ```
 
 | Key | Action |
@@ -135,6 +136,7 @@ Run `ph-tui` in a terminal. The home screen opens straight into the
 | `Ctrl-D` / `Ctrl-O` | Download / open the selected video in a browser |
 | `b` / `1` | Browse categories |
 | `/` | Search videos |
+| `x` | xHamster search |
 | `q` | Quit |
 
 The front page does not paginate; the four ordered feeds do. `2` / `u` still

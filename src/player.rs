@@ -16,8 +16,8 @@ use crate::model::watch_url;
 /// (for example an expired yt-dlp extractor) are visible instead of the player
 /// exiting silently. `--force-window=yes` makes the window appear immediately,
 /// giving feedback while yt-dlp resolves the URL.
-pub fn play(title: &str, viewkey: &str) -> bool {
-    let url = watch_url(viewkey);
+pub fn play(title: &str, identifier: &str) -> bool {
+    let url = source_url(identifier);
 
     println!();
     println!("  ▶ {title}");
@@ -49,8 +49,8 @@ pub fn play(title: &str, viewkey: &str) -> bool {
 }
 
 /// Download through yt-dlp into `$XDG_VIDEOS_DIR/ph-tui`.
-pub fn download(title: &str, viewkey: &str, quality: u8) -> bool {
-    let url = watch_url(viewkey);
+pub fn download(title: &str, identifier: &str, quality: u8) -> bool {
+    let url = source_url(identifier);
     let directory = download_dir();
 
     if let Err(error) = fs::create_dir_all(&directory) {
@@ -103,7 +103,7 @@ pub fn download(title: &str, viewkey: &str, quality: u8) -> bool {
 }
 
 /// Open the watch page in the system browser.
-pub fn open_in_browser(viewkey: &str) -> bool {
+pub fn open_in_browser(identifier: &str) -> bool {
     let opener = if cfg!(target_os = "macos") {
         "open"
     } else {
@@ -111,11 +111,21 @@ pub fn open_in_browser(viewkey: &str) -> bool {
     };
 
     Command::new(opener)
-        .arg(watch_url(viewkey))
+        .arg(source_url(identifier))
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .is_ok()
+}
+
+/// Accept either a bare viewkey or a full watch URL. xHamster results carry
+/// their own URL; PornHub results only need the viewkey.
+fn source_url(identifier: &str) -> String {
+    if identifier.starts_with("http") {
+        identifier.to_string()
+    } else {
+        watch_url(identifier)
+    }
 }
 
 fn download_dir() -> PathBuf {

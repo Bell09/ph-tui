@@ -22,7 +22,7 @@ use unicode_width::UnicodeWidthChar;
 type Term = ratatui::DefaultTerminal;
 
 use crate::http;
-use crate::model::{Category, FeedKind, Video};
+use crate::model::{watch_url, Category, FeedKind, Video};
 use crate::player;
 use crate::select::{Item, Kind, List};
 use crate::theme::Theme;
@@ -43,6 +43,7 @@ enum Nav {
     Search,
     Update,
     Quit,
+    Xhamster,
 }
 
 enum UiEvent {
@@ -76,6 +77,7 @@ enum UpdateState {
 enum Source {
     Category(Category),
     Search(String),
+    Xhamster { query: String },
 }
 
 impl Source {
@@ -83,6 +85,7 @@ impl Source {
         match self {
             Source::Category(category) => format!("Categories · {}", category.name),
             Source::Search(query) => format!("Search · {query}"),
+            Source::Xhamster { query } => format!("XHamster · {query}"),
         }
     }
 
@@ -90,6 +93,7 @@ impl Source {
         match self {
             Source::Category(_) => "Videos",
             Source::Search(_) => "Results",
+            Source::Xhamster { .. } => "XHamster Results",
         }
     }
 
@@ -97,8 +101,15 @@ impl Source {
         match self {
             Source::Category(category) => http::category_videos(&category.id, page),
             Source::Search(query) => http::search_videos(query, page),
+            Source::Xhamster { query } => http::xhamster_search(query, page),
         }
     }
+}
+
+/// Resolve the identifier a selected item should hand to playback, previews
+/// and the browser. xHamster items carry a full URL; PornHub items use a key.
+fn item_watch_url(item: &Item) -> String {
+    item.url.clone().unwrap_or_else(|| watch_url(&item.key))
 }
 
 enum ThumbState {
@@ -138,7 +149,7 @@ impl Thumb {
     /// quickly only fetches the preview for wherever the cursor settles.
     fn sync(&mut self, item: Option<&Item>) {
         let target = match item {
-            Some(item) if item.kind == Kind::Video => Some(item.key.clone()),
+            Some(item) if item.kind == Kind::Video => Some(item_watch_url(item)),
             _ => None,
         };
         if self.target == target {
@@ -270,6 +281,7 @@ impl App {
             match self.home(term)? {
                 Nav::Browse => self.browse_categories(term)?,
                 Nav::Search => self.search(term)?,
+                Nav::Xhamster => self.xhamster(term)?,
                 Nav::Update => self.update_screen(term)?,
                 Nav::Quit => break,
             }
@@ -419,6 +431,7 @@ impl App {
                             "Enter streams the video, ctrl-d downloads it, ctrl-o opens it in a browser.",
                         )
                         .image(video.preview.clone())
+                        .url(video.watch_url.clone())
                 })
                 .collect();
 
@@ -468,6 +481,7 @@ impl App {
                     }
                     Key::Char('/') => return Ok(Nav::Search),
                     Key::Char('b') | Key::Char('1') => return Ok(Nav::Browse),
+                    Key::Char('x') => return Ok(Nav::Xhamster),
                     Key::Char('2') | Key::Char('u') => return Ok(Nav::Update),
                     Key::Char('q') => return Ok(Nav::Quit),
                     Key::Ctrl('c') => self.quit(),
@@ -494,8 +508,8 @@ impl App {
                             break;
                         }
                         let title = item.label.clone();
-                        let viewkey = item.key.clone();
-                        self.play(term, &title, &viewkey)?;
+                        let url = item_watch_url(&item);
+                        self.play(term, &title, &url)?;
                     }
                     _ => {}
                 }
@@ -573,6 +587,24 @@ impl App {
         self.browse_results(term, Source::Search(query))
     }
 
+    /// xHamster source: opens the search prompt and loads results from
+    /// xhamster.desi. Pressing `x` from the home screen lands here.
+    fn xhamster(&mut self, term: &mut Term) -> Result<()> {
+        let query = self.text_input(
+            term,
+            "xHamster search",
+            "Type a query and press Enter. Results keep the site's own ranking.",
+            "",
+        )?;
+        let Some(query) = query else {
+            return Ok(());
+        };
+        if query.is_empty() {
+            return Ok(());
+        }
+        self.browse_results(term, Source::Xhamster { query })
+    }
+
     fn browse_results(&mut self, term: &mut Term, source: Source) -> Result<()> {
         let mut page: u32 = 1;
 
@@ -601,6 +633,7 @@ impl App {
                         .meta(format!("#{}", video.viewkey))
                         .detail("Enter streams the video, ctrl-d downloads it, ctrl-o opens it in a browser.")
                         .image(video.preview.clone())
+                        .url(video.watch_url.clone())
                 })
                 .collect();
 
@@ -644,8 +677,8 @@ impl App {
                             }
                             _ => {
                                 let title = item.label.clone();
-                                let key = item.key.clone();
-                                self.play(term, &title, &key)?;
+                                let url = item_watch_url(item);
+                                self.play(term, &title, &url)?;
                             }
                         }
                     }
@@ -693,9 +726,9 @@ impl App {
         }
 
         let title = item.label.clone();
-        let key = item.key.clone();
+        let url = item_watch_url(item);
         if let Some(quality) = self.choose_quality(term, &title)? {
-            self.download(term, &title, &key, quality)?;
+            self.download(term, &title, &url, quality)?;
         }
         Ok(())
     }
@@ -707,16 +740,16 @@ impl App {
         if item.kind != Kind::Video {
             return;
         }
-        if player::open_in_browser(&item.key) {
+        if player::open_in_browser(&item_watch_url(item)) {
             self.set_toast("Opened in your browser", Tone::Success);
         } else {
             self.set_toast("Could not find a browser opener", Tone::Error);
         }
     }
 
-    fn play(&mut self, term: &mut Term, title: &str, viewkey: &str) -> Result<()> {
+    fn play(&mut self, term: &mut Term, title: &str, identifier: &str) -> Result<()> {
         ratatui::restore();
-        let ok = player::play(title, viewkey);
+        let ok = player::play(title, identifier);
         *term = ratatui::init();
         term.clear()?;
         self.thumb.reset();
@@ -728,9 +761,15 @@ impl App {
         Ok(())
     }
 
-    fn download(&mut self, term: &mut Term, title: &str, viewkey: &str, quality: u8) -> Result<()> {
+    fn download(
+        &mut self,
+        term: &mut Term,
+        title: &str,
+        identifier: &str,
+        quality: u8,
+    ) -> Result<()> {
         ratatui::restore();
-        let ok = player::download(title, viewkey, quality);
+        let ok = player::download(title, identifier, quality);
         *term = ratatui::init();
         term.clear()?;
         self.thumb.reset();
