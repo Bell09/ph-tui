@@ -7,7 +7,7 @@ use scraper::{ElementRef, Html, Selector};
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::model::{watch_url, Category, Video};
+use crate::model::{watch_url, Category, FeedKind, Video};
 
 const BASE: &str = "https://www.pornhub.com";
 const USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 \
@@ -90,6 +90,23 @@ fn capitalize_first(word: &str) -> String {
         Some(first) => first.to_uppercase().chain(chars).collect(),
         None => String::new(),
     }
+}
+
+/// Videos in a home feed.
+///
+/// `Recommendations` is the personalized front page (it does not paginate);
+/// the rest are the site's own ordering pages, which do. All of them use the
+/// same listing parser as search and categories, so previews come for free.
+pub fn feed_videos(feed: FeedKind, page: u32) -> Result<Vec<Video>> {
+    let url = match feed {
+        FeedKind::Recommendations => format!("{BASE}/"),
+        FeedKind::Hottest => format!("{BASE}/video?o=ht&page={page}"),
+        FeedKind::MostViewed => format!("{BASE}/video?o=mv&page={page}"),
+        FeedKind::Newest => format!("{BASE}/video?o=cm&page={page}"),
+        FeedKind::TopRated => format!("{BASE}/video?o=tr&page={page}"),
+    };
+    let html = get_html(&url)?;
+    Ok(videos_from_html(&html))
 }
 
 /// Videos listed for a category.
@@ -371,6 +388,21 @@ mod tests {
 
         assert_eq!(og_image("<html><head></head></html>"), None);
         assert_eq!(og_image(r#"<meta property="og:image" content="  ">"#), None);
+    }
+
+    /// Hits the real site; run with `cargo test -- --ignored`.
+    #[test]
+    #[ignore]
+    fn live_home_feeds() {
+        for feed in FeedKind::ALL {
+            let videos = feed_videos(feed, 1).expect("home feed request");
+            assert!(!videos.is_empty(), "{} was empty", feed.label());
+            assert!(
+                videos.iter().any(|video| video.preview.is_some()),
+                "{} carried no thumbnails",
+                feed.label()
+            );
+        }
     }
 
     /// Hits the real site; run with `cargo test -- --ignored`.

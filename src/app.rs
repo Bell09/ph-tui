@@ -22,7 +22,7 @@ use unicode_width::UnicodeWidthChar;
 type Term = ratatui::DefaultTerminal;
 
 use crate::http;
-use crate::model::{Category, Video};
+use crate::model::{Category, FeedKind, Video};
 use crate::player;
 use crate::select::{Item, Kind, List};
 use crate::theme::Theme;
@@ -390,41 +390,124 @@ impl App {
 
     // ---------------------------------------------------------------- screens
 
+    /// Landing screen: a feed bar with the selected feed's videos beneath it.
     fn home(&mut self, term: &mut Term) -> Result<Nav> {
-        let mut list = List::new(vec![Item::new(Kind::Action, "browse", "Browse categories")
-            .meta("b")
-            .detail("Pick a category and page through its newest videos.")]);
+        let mut feed = FeedKind::Recommendations;
+        let mut page = 1u32;
         self.thumb.reset();
 
-        loop {
-            self.poll_update();
-            self.poll_theme();
-            term.draw(|frame| {
-                self.render_list_page(
-                    frame,
-                    "Home",
-                    "Start",
-                    &mut list,
-                    false,
-                    &[("/", "search"), ("b", "browse"), ("q", "quit")],
-                );
-            })?;
-
-            let Some(key) = tui::poll_key(POLL)? else {
-                continue;
+        'feeds: loop {
+            let active = feed;
+            let crumb = format!("Home · {}", active.label());
+            let subtitle = if active.paginated() {
+                format!("page {page}")
+            } else {
+                "front page".to_string()
             };
-            match key {
-                Key::Up => list.up(),
-                Key::Down => list.down(),
-                Key::Home => list.home(),
-                Key::End => list.end(),
-                Key::Enter => return Ok(Nav::Browse),
-                Key::Char('/') => return Ok(Nav::Search),
-                Key::Char('b') | Key::Char('1') => return Ok(Nav::Browse),
-                Key::Char('2') | Key::Char('u') => return Ok(Nav::Update),
-                Key::Char('q') => return Ok(Nav::Quit),
-                Key::Ctrl('c') => self.quit(),
-                _ => {}
+            let videos = self
+                .loading(term, &crumb, active.label(), &subtitle, move || {
+                    http::feed_videos(active, page)
+                })?
+                .unwrap_or_default();
+
+            let mut items: Vec<Item> = videos
+                .iter()
+                .map(|video| {
+                    Item::new(Kind::Video, video.viewkey.clone(), video.title.clone())
+                        .meta(format!("#{}", video.viewkey))
+                        .detail(
+                            "Enter streams the video, ctrl-d downloads it, ctrl-o opens it in a browser.",
+                        )
+                        .image(video.preview.clone())
+                })
+                .collect();
+
+            if active.paginated() {
+                if page > 1 {
+                    items.push(
+                        Item::new(Kind::Nav, "PREV", "<<< Previous page")
+                            .detail("Go back one page of this feed."),
+                    );
+                }
+                items.push(
+                    Item::new(Kind::Nav, "NEXT", ">>> Next page")
+                        .detail("Load the next page of this feed."),
+                );
+            }
+
+            let mut list = List::new(items);
+            let mut next: Option<(FeedKind, u32)> = None;
+
+            loop {
+                self.poll_update();
+                self.poll_theme();
+                self.thumb.sync(list.selected());
+                self.thumb.poll(&self.picker);
+                term.draw(|frame| self.render_feed_page(frame, active, page, &mut list))?;
+
+                let Some(key) = tui::poll_key(POLL)? else {
+                    continue;
+                };
+                match key {
+                    Key::Char('r') => next = Some((FeedKind::Recommendations, 1)),
+                    Key::Char('h') => next = Some((FeedKind::Hottest, 1)),
+                    Key::Char('v') => next = Some((FeedKind::MostViewed, 1)),
+                    Key::Char('n') => next = Some((FeedKind::Newest, 1)),
+                    Key::Char('t') => next = Some((FeedKind::TopRated, 1)),
+                    Key::Tab | Key::BackTab => {
+                        let index = FeedKind::ALL
+                            .iter()
+                            .position(|candidate| *candidate == active)
+                            .unwrap_or(0);
+                        let step = if key == Key::Tab {
+                            1
+                        } else {
+                            FeedKind::ALL.len() - 1
+                        };
+                        next = Some((FeedKind::ALL[(index + step) % FeedKind::ALL.len()], 1));
+                    }
+                    Key::Char('/') => return Ok(Nav::Search),
+                    Key::Char('b') | Key::Char('1') => return Ok(Nav::Browse),
+                    Key::Char('2') | Key::Char('u') => return Ok(Nav::Update),
+                    Key::Char('q') => return Ok(Nav::Quit),
+                    Key::Ctrl('c') => self.quit(),
+                    Key::Ctrl('d') => self.download_selected(term, &list)?,
+                    Key::Ctrl('o') => self.browser_selected(&list),
+                    Key::Up => list.up(),
+                    Key::Down => list.down(),
+                    Key::PageUp => list.page_up(self.visible_rows.max(1)),
+                    Key::PageDown => list.page_down(self.visible_rows.max(1)),
+                    Key::Home => list.home(),
+                    Key::End => list.end(),
+                    Key::Enter => {
+                        let Some(index) = list.selected_index() else {
+                            continue;
+                        };
+                        let item = list.items[index].clone();
+                        if item.kind == Kind::Nav {
+                            page = if item.key == "NEXT" {
+                                page + 1
+                            } else {
+                                page.saturating_sub(1).max(1)
+                            };
+                            next = Some((active, page));
+                            break;
+                        }
+                        let title = item.label.clone();
+                        let viewkey = item.key.clone();
+                        self.play(term, &title, &viewkey)?;
+                    }
+                    _ => {}
+                }
+                if next.is_some() {
+                    break;
+                }
+            }
+
+            if let Some((selected, selected_page)) = next {
+                feed = selected;
+                page = selected_page;
+                continue 'feeds;
             }
         }
     }
@@ -878,6 +961,56 @@ impl App {
         hints.push(("esc", "back"));
         hints.push(("ctrl-c", "quit"));
         self.render_status(frame, chunks[4], &status, &hints);
+    }
+
+    /// Home keeps the two chrome rules, but spends its body's first row on the
+    /// feed bar before the video list and preview.
+    fn render_feed_page(&mut self, frame: &mut Frame, feed: FeedKind, page: u32, list: &mut List) {
+        let theme = self.theme;
+        let area = frame.area();
+        if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
+            render_too_small(frame, &theme, area);
+            return;
+        }
+
+        let chunks = chrome_layout(area);
+        self.render_header(frame, chunks[0], &format!("Home · {}", feed.label()));
+        render_rule(frame, chunks[1], &theme);
+
+        let body = chunks[2];
+        let bar_area = Rect::new(body.x, body.y, body.width, 1);
+        let content = Rect::new(
+            body.x,
+            body.y + 1,
+            body.width,
+            body.height.saturating_sub(1),
+        );
+        render_feed_bar(frame, bar_area, feed, &theme);
+
+        let (list_area, details_area) = body_layout(content);
+        let counter = format!("{} / {}", list.matches.len(), list.items.len());
+        self.render_list_panel(frame, list_area, list, feed.label(), &counter, false);
+        self.render_details(frame, details_area, list.selected());
+
+        render_rule(frame, chunks[3], &theme);
+        let status = format!(
+            "{} videos · {} shown · page {page}",
+            list.items.len(),
+            list.matches.len()
+        );
+        self.render_status(
+            frame,
+            chunks[4],
+            &status,
+            &[
+                ("↑↓", "move"),
+                ("enter", "watch"),
+                ("tab", "feed"),
+                ("/", "search"),
+                ("b", "browse"),
+                ("q", "quit"),
+            ],
+        );
     }
 
     fn render_list_panel(
@@ -1470,6 +1603,48 @@ fn render_rule(frame: &mut Frame, area: Rect, theme: &Theme) {
     );
 }
 
+/// One compact row of feeds. The active feed is highlighted; narrow terminals
+/// fall back to just the active feed and the categories shortcut.
+fn render_feed_bar(frame: &mut Frame, area: Rect, active: FeedKind, theme: &Theme) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+
+    let feeds: &[FeedKind] = if area.width < 96 {
+        std::slice::from_ref(&active)
+    } else {
+        &FeedKind::ALL
+    };
+    let mut spans = Vec::new();
+    for (index, feed) in feeds.iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::styled("  ·  ", Style::default().fg(theme.faint)));
+        }
+        let selected = *feed == active;
+        let style = if selected {
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme.dim)
+        };
+        spans.push(Span::styled(feed.key(), style));
+        spans.push(Span::styled(format!(" {}", feed.label()), style));
+    }
+    spans.push(Span::styled("  ·  ", Style::default().fg(theme.faint)));
+    spans.push(Span::styled(
+        "b",
+        Style::default()
+            .fg(theme.accent_soft)
+            .add_modifier(Modifier::BOLD),
+    ));
+    spans.push(Span::styled(
+        " Browse categories",
+        Style::default().fg(theme.dim),
+    ));
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
 fn hints_line(theme: &Theme, hints: &[(&str, &str)]) -> Line<'static> {
     let mut spans = vec![Span::raw(" ")];
     for (index, (key, action)) in hints.iter().enumerate() {
@@ -1671,6 +1846,54 @@ mod tests {
             out.push('\n');
         }
         out
+    }
+
+    fn render_feed(app: &mut App, feed: FeedKind, width: u16, height: u16) -> String {
+        let mut list = List::new(vec![Item::new(
+            Kind::Video,
+            "abc123",
+            "A recommended video",
+        )
+        .meta("#abc123")]);
+        let backend = TestBackend::new(width, height);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|frame| {
+            app.render_feed_page(frame, feed, 1, &mut list);
+        })
+        .unwrap();
+
+        let buffer = term.backend().buffer();
+        let mut out = String::new();
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                out.push_str(buffer[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    #[test]
+    fn home_shows_every_feed_in_the_bar() {
+        let screen = render_feed(&mut App::headless(), FeedKind::Recommendations, 140, 40);
+        assert!(screen.contains("Home · Recommendations"), "{screen}");
+        for feed in FeedKind::ALL {
+            assert!(
+                screen.contains(feed.label()),
+                "missing {}: {screen}",
+                feed.label()
+            );
+        }
+        assert!(screen.contains("Browse categories"), "{screen}");
+        assert!(screen.contains("A recommended video"), "{screen}");
+    }
+
+    #[test]
+    fn home_feed_bar_compacts_on_narrow_terminals() {
+        let screen = render_feed(&mut App::headless(), FeedKind::Newest, 70, 24);
+        assert!(screen.contains("Newest"), "{screen}");
+        assert!(screen.contains("Browse categories"), "{screen}");
+        assert!(!screen.contains("Hottest"), "{screen}");
     }
 
     #[test]

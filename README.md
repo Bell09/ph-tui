@@ -30,6 +30,8 @@ Rust. The interface is built with `ratatui`, previews use `ratatui-image`, and
   fallback on terminals that support neither
 - **Fast filtering** — fuzzy match with highlighted characters, paging and a
   scrollbar, all in-process
+- **Home feeds** — a feed bar with Recommendations, Hottest, Most Viewed, Newest
+  and Top Rated; each feed loads real videos with inline previews
 - **Categories and search** — fetch from the site directly, page through results
 - **Playback** — hand the watch page to `mpv`, which resolves the stream through
   `yt-dlp`; playback is always capped at 320p
@@ -109,16 +111,34 @@ Or use the helper script, which installs to `/usr/local/bin` by default:
 
 ## Usage
 
-Run `ph-tui` in a terminal. The home screen has one item — Browse categories:
+Run `ph-tui` in a terminal. The home screen opens straight into the
+**Recommendations** feed (the personalized front page) and shows a feed bar:
+
+```
+ ◆ ph-tui  ›  Home · Recommendations                 v0.1.0
+────────────────────────────────────────────────────────────────────────────────
+ r Recommendations  ·  h Hottest  ·  v Most Viewed  ·  n Newest  ·  t Top Rated  ·  b Browse categories
+ Recommendations
+ ▌ A recommended video                      #abc123  ▄▄▀▀▄▄▀▀▄▄▀▀▄▄▀▀▄▄▀▀▄▄▀▀▄▄
+   Another recommendation                   #def456  VIDEO
+   ...                                               A recommended video
+────────────────────────────────────────────────────────────────────────────────
+ · N videos · N shown · page 1    ↑↓ move · enter watch · tab feed · / search · b browse · q quit
+```
 
 | Key | Action |
 | --- | --- |
+| `r`, `h`, `v`, `n`, `t` | Recommendations, Hottest, Most Viewed, Newest, Top Rated |
+| `Tab` / `Shift-Tab` | Cycle feeds |
+| `↑` / `↓`, `PgUp` / `PgDn` | Move through the feed / change page |
+| `Enter` | Watch the selected video; `>>> Next page` works on ordered feeds |
+| `Ctrl-D` / `Ctrl-O` | Download / open the selected video in a browser |
 | `b` / `1` | Browse categories |
 | `/` | Search videos |
 | `q` | Quit |
 
-`2` / `u` still check for updates from the home screen, but the update check is
-no longer a menu item.
+The front page does not paginate; the four ordered feeds do. `2` / `u` still
+check for updates from the home screen, but the update check is not in the bar.
 
 ### Lists
 
@@ -172,8 +192,8 @@ cargo test                  # parser, list, preview, theme and render tests
 cargo test -- --ignored     # live requests against the real site
 ```
 
-The ignored tests perform real HTTP requests for categories, a category page,
-a search page and a preview image.
+The ignored tests perform real HTTP requests for all five home feeds,
+categories, a category page, a search page and a preview image.
 
 ## Notes and limitations
 
