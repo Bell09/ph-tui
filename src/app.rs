@@ -1035,19 +1035,7 @@ impl App {
             list.items.len(),
             list.matches.len()
         );
-        self.render_status(
-            frame,
-            chunks[4],
-            &status,
-            &[
-                ("↑↓", "move"),
-                ("enter", "watch"),
-                ("tab", "feed"),
-                ("/", "search"),
-                ("b", "browse"),
-                ("q", "quit"),
-            ],
-        );
+        self.render_status(frame, chunks[4], &status, &home_hints());
     }
 
     fn render_list_panel(
@@ -1681,6 +1669,19 @@ fn render_feed_bar(frame: &mut Frame, area: Rect, active: FeedKind, theme: &Them
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
+/// Home keybind guide shown on the bottom status row.
+fn home_hints() -> [(&'static str, &'static str); 7] {
+    [
+        ("↑↓", "move"),
+        ("enter", "watch"),
+        ("tab", "feed"),
+        ("/", "search"),
+        ("x", "xhamster"),
+        ("b", "browse"),
+        ("q", "quit"),
+    ]
+}
+
 fn hints_line(theme: &Theme, hints: &[(&str, &str)]) -> Line<'static> {
     let mut spans = vec![Span::raw(" ")];
     for (index, (key, action)) in hints.iter().enumerate() {
@@ -1926,6 +1927,7 @@ mod tests {
         }
         assert!(screen.contains("Browse categories"), "{screen}");
         assert!(screen.contains("A recommended video"), "{screen}");
+        assert!(screen.contains("x xhamster"), "missing x hint: {screen}");
     }
 
     #[test]
