@@ -116,8 +116,11 @@ pub fn category_videos(category_id: &str, page: u32) -> Result<Vec<Video>> {
     Ok(videos_from_html(&html))
 }
 
-/// Search results, filtered so that at least one query keyword appears in the
-/// title (the site's search page is loose about relevance).
+/// Search results.
+///
+/// The site already ranks matches, so its order is kept as-is. Filtering on
+/// literal title keywords used to drop most results (a `pov` search returned
+/// zero even though the page was full of matches).
 pub fn search_videos(query: &str, page: u32) -> Result<Vec<Video>> {
     let url = format!("{BASE}/video/search");
     let response = client()?
@@ -129,41 +132,56 @@ pub fn search_videos(query: &str, page: u32) -> Result<Vec<Video>> {
         bail!("unexpected HTTP status {} for {url}", response.status());
     }
     let html = response.text().context("failed to read response body")?;
-    Ok(filter_by_keywords(videos_from_html(&html), query))
-}
-
-pub fn filter_by_keywords(videos: Vec<Video>, query: &str) -> Vec<Video> {
-    let keywords: Vec<String> = query.split_whitespace().map(|w| w.to_lowercase()).collect();
-    if keywords.is_empty() {
-        return videos;
-    }
-    videos
-        .into_iter()
-        .filter(|video| {
-            let title = video.title.to_lowercase();
-            keywords.iter().any(|keyword| title.contains(keyword))
-        })
-        .collect()
+    Ok(videos_from_html(&html))
 }
 
 /// Extract unique, titled video links from a results page.
+///
+/// Search, category and ordered-feed pages all wrap their real results in a
+/// known `<ul>`. Scoping to it keeps the header dropdowns (hottest, recommended,
+/// playlists) out of the list. The front page has no single container, so it
+/// falls back to a document-wide scan.
 pub fn videos_from_html(html: &str) -> Vec<Video> {
     let document = Html::parse_document(html);
-    let selector = Selector::parse("a[href]").expect("static selector is valid");
     let images = Selector::parse("img").expect("static selector is valid");
-
     let mut positions: HashMap<String, usize> = HashMap::new();
     let mut videos: Vec<Video> = Vec::new();
 
-    for element in document.select(&selector) {
+    for container in ["#videoSearchResult", "#videoCategory"] {
+        let selector = Selector::parse(container).expect("static selector is valid");
+        if let Some(root) = document.select(&selector).next() {
+            collect_videos(root, &images, &mut positions, &mut videos);
+            if !videos.is_empty() {
+                return videos;
+            }
+        }
+    }
+
+    collect_videos(
+        document.root_element(),
+        &images,
+        &mut positions,
+        &mut videos,
+    );
+    videos
+}
+
+fn collect_videos(
+    root: ElementRef<'_>,
+    images: &Selector,
+    positions: &mut HashMap<String, usize>,
+    videos: &mut Vec<Video>,
+) {
+    let selector = Selector::parse("a[href]").expect("static selector is valid");
+    for element in root.select(&selector) {
         let Some(href) = element.value().attr("href") else {
             continue;
         };
         let Some(viewkey) = viewkey_from_href(href) else {
             continue;
         };
-        let title = element.value().attr("title").unwrap_or("").trim();
-        let preview = preview_from_link(&element, &images);
+        let title = decode_entities(element.value().attr("title").unwrap_or("").trim());
+        let preview = preview_from_link(&element, images);
 
         if let Some(&index) = positions.get(&viewkey) {
             // The title anchor often follows the thumbnail anchor; keep the
@@ -180,12 +198,55 @@ pub fn videos_from_html(html: &str) -> Vec<Video> {
         positions.insert(viewkey.clone(), videos.len());
         videos.push(Video {
             viewkey,
-            title: title.to_string(),
+            title,
             preview,
         });
     }
+}
 
-    videos
+/// Decode the HTML entities that listing pages leave in `title` attributes.
+fn decode_entities(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find('&') {
+        out.push_str(&rest[..start]);
+        let after = &rest[start..];
+        let decoded = after
+            .find(';')
+            .and_then(|end| entity_char(&after[1..end]).map(|ch| (ch, end)));
+        match decoded {
+            Some((ch, end)) => {
+                out.push(ch);
+                rest = &after[end + 1..];
+            }
+            None => {
+                out.push('&');
+                rest = &after[1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+fn entity_char(entity: &str) -> Option<char> {
+    match entity {
+        "amp" => Some('&'),
+        "lt" => Some('<'),
+        "gt" => Some('>'),
+        "quot" => Some('"'),
+        "apos" => Some('\''),
+        "nbsp" => Some(' '),
+        _ => {
+            let code = entity.strip_prefix('#')?;
+            let value = if let Some(hex) = code.strip_prefix(['x', 'X']) {
+                u32::from_str_radix(hex, 16).ok()?
+            } else {
+                code.parse::<u32>().ok()?
+            };
+            char::from_u32(value)
+        }
+    }
 }
 
 /// Most listing anchors wrap their `<img>` and expose the still frame on one
@@ -343,27 +404,38 @@ mod tests {
     }
 
     #[test]
-    fn search_filter_keeps_titles_with_a_keyword() {
-        let videos = vec![
-            Video {
-                viewkey: "a".into(),
-                title: "Big Tits Compilation".into(),
-                preview: None,
-            },
-            Video {
-                viewkey: "b".into(),
-                title: "Something unrelated".into(),
-                preview: None,
-            },
-            Video {
-                viewkey: "c".into(),
-                title: "Amateur BIG scene".into(),
-                preview: None,
-            },
-        ];
-        let filtered = filter_by_keywords(videos, "big amateur");
-        let keys: Vec<&str> = filtered.iter().map(|v| v.viewkey.as_str()).collect();
-        assert_eq!(keys, ["a", "c"]);
+    fn keeps_the_search_results_and_ignores_header_dropdowns() {
+        // Search pages embed "hottest" and "recommended" dropdown menus above
+        // the real results; only `#videoSearchResult` belongs in the list.
+        let html = r#"
+            <html><body>
+              <ul id="hottestMenuSection" class="videos">
+                <li><a href="/view_video.php?viewkey=menu1" title="Menu video">x</a></li>
+              </ul>
+              <ul id="videoSearchResult" class="videos search-video-thumbs">
+                <li><a href="/view_video.php?viewkey=real1" title="First result">x</a></li>
+                <li><a href="/view_video.php?viewkey=real2" title="Second result">x</a></li>
+              </ul>
+              <ul id="bottomVideos" class="videos">
+                <li><a href="/view_video.php?viewkey=bottom" title="Bottom promo">x</a></li>
+              </ul>
+            </body></html>
+        "#;
+        let videos = videos_from_html(html);
+        let keys: Vec<&str> = videos.iter().map(|v| v.viewkey.as_str()).collect();
+        assert_eq!(keys, ["real1", "real2"]);
+    }
+
+    #[test]
+    fn decodes_entities_in_titles() {
+        let html = r#"
+            <ul id="videoCategory" class="videos">
+              <a href="/view_video.php?viewkey=abc"
+                 title="Tom &amp; Jerry&#039;s &quot;big&quot; scene"></a>
+            </ul>
+        "#;
+        let videos = videos_from_html(html);
+        assert_eq!(videos[0].title, "Tom & Jerry's \"big\" scene");
     }
 
     #[test]
@@ -432,6 +504,9 @@ mod tests {
             videos.iter().any(|video| video.preview.is_some()),
             "listing page carried no thumbnails"
         );
+        // Regression: title keyword filtering used to drop every `pov` hit.
+        let pov = search_videos("pov", 1).expect("pov search request");
+        assert!(!pov.is_empty(), "pov search returned nothing");
     }
 
     /// Hits the real site; run with `cargo test -- --ignored`.

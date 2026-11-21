@@ -159,12 +159,17 @@ as you move the selection; it is fetched once and then read from the cache.
 
 ### Search input
 
+Press `/` and the prompt appears on the top row, utui-style (`/ your query`),
+with the caret in place while you type.
+
 | Key | Action |
 | --- | --- |
 | `Enter` | Run the search |
 | `←` / `→`, `Home` / `End` | Move the caret |
 | `Ctrl-W`, `Ctrl-U` | Delete a word / the whole query |
 | `Esc` | Cancel |
+
+Results keep the site's own ranking; no titles are filtered out locally.
 
 ## Options
 

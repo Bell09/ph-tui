@@ -559,9 +559,8 @@ impl App {
         let initial = self.last_query.clone();
         let query = self.text_input(
             term,
-            "Search",
             "Search query",
-            "Separate words to require any of them; the result list can then be filtered.",
+            "Type a query and press Enter. Results keep the site's own ranking.",
             &initial,
         )?;
         let Some(query) = query else {
@@ -819,7 +818,6 @@ impl App {
     fn text_input(
         &mut self,
         term: &mut Term,
-        crumb: &str,
         title: &str,
         hint: &str,
         initial: &str,
@@ -831,7 +829,7 @@ impl App {
         loop {
             self.poll_update();
             self.poll_theme();
-            term.draw(|frame| self.render_input(frame, crumb, title, hint, &chars, cursor))?;
+            term.draw(|frame| self.render_input(frame, title, hint, &chars, cursor))?;
 
             let Some(key) = tui::poll_key(POLL)? else {
                 continue;
@@ -1324,7 +1322,6 @@ impl App {
     fn render_input(
         &mut self,
         frame: &mut Frame,
-        crumb: &str,
         title: &str,
         hint: &str,
         chars: &[char],
@@ -1338,7 +1335,9 @@ impl App {
         }
 
         let chunks = chrome_layout(area);
-        self.render_header(frame, chunks[0], crumb);
+        // utui-style: the search prompt owns the top-most row, where the
+        // header normally sits. `/` marks the prompt and the query follows it.
+        self.render_search_prompt(frame, chunks[0], chars, cursor);
         render_rule(frame, chunks[1], &theme);
         let (main, details) = body_layout(chunks[2]);
 
@@ -1346,61 +1345,15 @@ impl App {
         let inner = block.inner(main);
         frame.render_widget(block, main);
 
-        if inner.width > 4 && inner.height > 3 {
-            let max = inner.width.saturating_sub(4) as usize;
-
-            // Scroll the text so the caret stays visible.
-            let mut start = 0usize;
-            let prefix = |end: usize| -> String { chars[..end].iter().collect() };
-            let mut prefix_width = tui::width_of(&prefix(cursor));
-            while prefix_width >= max && start < cursor {
-                prefix_width -= tui::width_of(&chars[start].to_string());
-                start += 1;
-            }
-
-            let visible: String = chars[start..].iter().collect();
-            let shown = if visible.is_empty() {
-                "search…".to_string()
-            } else {
-                tui::truncate(&visible, max)
-            };
-            let shown_style = if chars.is_empty() {
-                Style::default().fg(theme.faint)
-            } else {
-                Style::default().fg(theme.text)
-            };
-
-            let row = Rect::new(inner.x + 2, inner.y + 1, inner.width.saturating_sub(4), 1);
-            frame.render_widget(
-                Paragraph::new(Line::from(vec![
-                    Span::styled("⌕ ", Style::default().fg(theme.accent)),
-                    Span::styled(shown, shown_style),
-                ])),
-                row,
-            );
-
-            if inner.height > 3 {
-                frame.render_widget(
-                    Paragraph::new(Line::from(Span::styled(
-                        hint.to_string(),
-                        Style::default().fg(theme.faint),
-                    )))
-                    .wrap(Wrap { trim: true }),
-                    Rect::new(
-                        inner.x + 1,
-                        inner.y + 3,
-                        inner.width.saturating_sub(2),
-                        inner.height.saturating_sub(3),
-                    ),
-                );
-            }
-
-            let caret_offset =
-                tui::width_of(&prefix(cursor)).saturating_sub(tui::width_of(&prefix(start)));
-            let caret_x =
-                (inner.x + 2 + caret_offset as u16).min(inner.x + inner.width.saturating_sub(2));
-            frame.set_cursor_position((caret_x, inner.y + 1));
-        }
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                hint.to_string(),
+                Style::default().fg(theme.faint),
+            )))
+            .wrap(Wrap { trim: true })
+            .block(Block::default().padding(Padding::new(2, 1, 0, 0))),
+            inner,
+        );
 
         let tips = Item::new(Kind::Action, "", "Search tips").detail(
             "Enter starts the search. Esc returns without searching. Ctrl-W deletes a word.",
@@ -1419,6 +1372,53 @@ impl App {
                 ("ctrl-c", "quit"),
             ],
         );
+    }
+
+    /// Draw the utui-style prompt on the top row: `/` then the query, with
+    /// horizontal scrolling so the caret stays visible in a long query.
+    fn render_search_prompt(&self, frame: &mut Frame, area: Rect, chars: &[char], cursor: usize) {
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+        let theme = self.theme;
+        let row = Rect::new(area.x, area.y, area.width, 1);
+        let prefix = "/ ";
+        let prefix_width = tui::width_of(prefix);
+        let max = area.width.saturating_sub(prefix_width as u16) as usize;
+
+        let mut spans = vec![Span::styled(
+            prefix,
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
+        )];
+
+        if chars.is_empty() {
+            spans.push(Span::styled("search…", Style::default().fg(theme.faint)));
+            frame.render_widget(Paragraph::new(Line::from(spans)), row);
+            frame.set_cursor_position((area.x + prefix_width as u16, row.y));
+            return;
+        }
+
+        // Drop leading characters until the caret fits inside the row.
+        let mut start = 0usize;
+        while tui::width_of(&chars[start..cursor].iter().collect::<String>()) >= max
+            && start < cursor
+        {
+            start += 1;
+        }
+
+        let visible: String = chars[start..].iter().collect();
+        spans.push(Span::styled(
+            tui::truncate(&visible, max),
+            Style::default().fg(theme.text),
+        ));
+        frame.render_widget(Paragraph::new(Line::from(spans)), row);
+
+        let caret_offset = tui::width_of(&chars[start..cursor].iter().collect::<String>());
+        let caret_x =
+            (area.x + prefix_width as u16 + caret_offset as u16).min(row.right().saturating_sub(1));
+        frame.set_cursor_position((caret_x, row.y));
     }
 
     fn render_loading(
@@ -1895,6 +1895,36 @@ mod tests {
         assert!(screen.contains("Newest"), "{screen}");
         assert!(screen.contains("Browse categories"), "{screen}");
         assert!(!screen.contains("Hottest"), "{screen}");
+    }
+
+    #[test]
+    fn search_prompt_owns_the_top_row() {
+        let mut app = App::headless();
+        let chars: Vec<char> = "pov".chars().collect();
+        let backend = TestBackend::new(120, 36);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|frame| {
+            app.render_input(frame, "Search query", "Type a query", &chars, chars.len());
+        })
+        .unwrap();
+
+        let buffer = term.backend().buffer();
+        let row = |y: u16| -> String {
+            (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect()
+        };
+        assert!(row(0).starts_with("/ pov"), "prompt not on top: {}", row(0));
+        assert!(
+            !row(0).contains("ph-tui"),
+            "header should yield the top row: {}",
+            row(0)
+        );
+        assert!(
+            row(1).chars().all(|ch| ch == '─' || ch == ' '),
+            "rule should follow the prompt: {}",
+            row(1)
+        );
     }
 
     #[test]
