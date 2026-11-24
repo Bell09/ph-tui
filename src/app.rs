@@ -43,7 +43,30 @@ enum Nav {
     Search,
     Update,
     Quit,
+}
+
+/// Which site's home feed is currently on screen. `x` toggles this, so the
+/// feed bar and `/` search always follow the active site.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HomeSite {
+    Pornhub,
     Xhamster,
+}
+
+impl HomeSite {
+    fn label(self) -> &'static str {
+        match self {
+            HomeSite::Pornhub => "Pornhub",
+            HomeSite::Xhamster => "XHamster",
+        }
+    }
+
+    fn toggle(self) -> Self {
+        match self {
+            HomeSite::Pornhub => HomeSite::Xhamster,
+            HomeSite::Xhamster => HomeSite::Pornhub,
+        }
+    }
 }
 
 enum UiEvent {
@@ -77,6 +100,7 @@ enum UpdateState {
 #[derive(Clone)]
 enum Source {
     Category(Category),
+    XhamsterCategory(Category),
     Search(String),
     Xhamster { query: String },
     Channel { name: String, url: String },
@@ -86,6 +110,7 @@ impl Source {
     fn crumb(&self) -> String {
         match self {
             Source::Category(category) => format!("Categories · {}", category.name),
+            Source::XhamsterCategory(category) => format!("XHamster · {}", category.name),
             Source::Search(query) => format!("Search · {query}"),
             Source::Xhamster { query } => format!("XHamster · {query}"),
             Source::Channel { name, .. } => format!("Channel · {name}"),
@@ -95,6 +120,7 @@ impl Source {
     fn panel_title(&self) -> &'static str {
         match self {
             Source::Category(_) => "Videos",
+            Source::XhamsterCategory(_) => "XHamster Videos",
             Source::Search(_) => "Results",
             Source::Xhamster { .. } => "XHamster Results",
             Source::Channel { .. } => "Channel Videos",
@@ -104,6 +130,9 @@ impl Source {
     fn fetch(&self, page: u32) -> Result<Vec<Video>> {
         match self {
             Source::Category(category) => http::category_videos(&category.id, page),
+            Source::XhamsterCategory(category) => {
+                http::xhamster_category_videos(&category.id, page)
+            }
             Source::Search(query) => http::search_videos(query, page),
             Source::Xhamster { query } => http::xhamster_search(query, page),
             Source::Channel { url, .. } => http::channel_videos(url, page),
@@ -224,6 +253,7 @@ impl Thumb {
 pub struct App {
     picker: Picker,
     thumb: Thumb,
+    site: HomeSite,
     theme: Theme,
     /// Palette file being followed, plus its mtime: lets `poll_theme` notice
     /// a wallpaper change with a single `stat()` in the steady state.
@@ -264,6 +294,7 @@ impl App {
         Self {
             picker,
             thumb: Thumb::new(),
+            site: HomeSite::Pornhub,
             theme,
             theme_src,
             theme_mtime,
@@ -286,7 +317,6 @@ impl App {
             match self.home(term)? {
                 Nav::Browse => self.browse_categories(term)?,
                 Nav::Search => self.search(term)?,
-                Nav::Xhamster => self.xhamster(term)?,
                 Nav::Update => self.update_screen(term)?,
                 Nav::Quit => break,
             }
@@ -415,16 +445,24 @@ impl App {
 
         'feeds: loop {
             let active = feed;
-            let crumb = format!("Home · {}", active.label());
+            let site = self.site;
+            let crumb = format!("{} · {}", site.label(), active.label());
             let subtitle = if active.paginated() {
                 format!("page {page}")
             } else {
                 "front page".to_string()
             };
             let videos = self
-                .loading(term, &crumb, active.label(), &subtitle, move || {
-                    http::feed_videos(active, page)
-                })?
+                .loading(
+                    term,
+                    &crumb,
+                    active.label(),
+                    &subtitle,
+                    move || match site {
+                        HomeSite::Pornhub => http::feed_videos(active, page),
+                        HomeSite::Xhamster => http::xhamster_feed_videos(active, page),
+                    },
+                )?
                 .unwrap_or_default();
 
             let mut items: Vec<Item> = videos
@@ -496,7 +534,10 @@ impl App {
                     }
                     Key::Char('/') => return Ok(Nav::Search),
                     Key::Char('b') | Key::Char('1') => return Ok(Nav::Browse),
-                    Key::Char('x') => return Ok(Nav::Xhamster),
+                    Key::Char('x') => {
+                        self.site = self.site.toggle();
+                        next = Some((FeedKind::Recommendations, 1));
+                    }
                     Key::Char('2') | Key::Char('u') => return Ok(Nav::Update),
                     Key::Char('q') => return Ok(Nav::Quit),
                     Key::Ctrl('c') => self.quit(),
@@ -542,12 +583,16 @@ impl App {
     }
 
     fn browse_categories(&mut self, term: &mut Term) -> Result<()> {
+        let site = self.site;
         let categories = self.loading(
             term,
             "Categories",
             "Fetching categories",
             "reading the category index",
-            http::categories,
+            move || match site {
+                HomeSite::Pornhub => http::categories(),
+                HomeSite::Xhamster => http::xhamster_categories(),
+            },
         )?;
         let Some(categories) = categories else {
             return Ok(());
@@ -579,20 +624,28 @@ impl App {
                         id: item.key,
                         name: item.label,
                     };
-                    self.browse_results(term, Source::Category(category))?;
+                    match site {
+                        HomeSite::Pornhub => {
+                            self.browse_results(term, Source::Category(category))?
+                        }
+                        HomeSite::Xhamster => {
+                            self.browse_results(term, Source::XhamsterCategory(category))?
+                        }
+                    }
                 }
             }
         }
     }
 
+    /// Search follows the active home site: PornHub by default, xHamster after
+    /// pressing `x`. The site toggle stays in effect when returning home.
     fn search(&mut self, term: &mut Term) -> Result<()> {
+        let (title, hint) = match self.site {
+            HomeSite::Pornhub => ("Search query", "Type a query and press Enter."),
+            HomeSite::Xhamster => ("xHamster search", "Type a query and press Enter."),
+        };
         let initial = self.last_query.clone();
-        let query = self.text_input(
-            term,
-            "Search query",
-            "Type a query and press Enter. Results keep the site's own ranking.",
-            &initial,
-        )?;
+        let query = self.text_input(term, title, hint, &initial)?;
         let Some(query) = query else {
             return Ok(());
         };
@@ -600,25 +653,10 @@ impl App {
             return Ok(());
         }
         self.last_query = query.clone();
-        self.browse_results(term, Source::Search(query))
-    }
-
-    /// xHamster source: opens the search prompt and loads results from
-    /// xhamster.desi. Pressing `x` from the home screen lands here.
-    fn xhamster(&mut self, term: &mut Term) -> Result<()> {
-        let query = self.text_input(
-            term,
-            "xHamster search",
-            "Type a query and press Enter. Results keep the site's own ranking.",
-            "",
-        )?;
-        let Some(query) = query else {
-            return Ok(());
-        };
-        if query.is_empty() {
-            return Ok(());
+        match self.site {
+            HomeSite::Pornhub => self.browse_results(term, Source::Search(query)),
+            HomeSite::Xhamster => self.browse_results(term, Source::Xhamster { query }),
         }
-        self.browse_results(term, Source::Xhamster { query })
     }
 
     fn browse_results(&mut self, term: &mut Term, source: Source) -> Result<()> {
@@ -1064,7 +1102,11 @@ impl App {
         }
 
         let chunks = chrome_layout(area);
-        self.render_header(frame, chunks[0], &format!("Home · {}", feed.label()));
+        self.render_header(
+            frame,
+            chunks[0],
+            &format!("{} · {}", self.site.label(), feed.label()),
+        );
         render_rule(frame, chunks[1], &theme);
 
         let body = chunks[2];
@@ -1088,7 +1130,7 @@ impl App {
             list.items.len(),
             list.matches.len()
         );
-        self.render_status(frame, chunks[4], &status, &home_hints());
+        self.render_status(frame, chunks[4], &status, &home_hints(self.site));
     }
 
     fn render_list_panel(
@@ -1722,15 +1764,20 @@ fn render_feed_bar(frame: &mut Frame, area: Rect, active: FeedKind, theme: &Them
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-/// Home keybind guide shown on the bottom status row.
-fn home_hints() -> [(&'static str, &'static str); 8] {
+/// Home keybind guide shown on the bottom status row. The `x` hint names the
+/// site you would switch to, so it flips when the home feed changes.
+fn home_hints(site: HomeSite) -> [(&'static str, &'static str); 8] {
+    let switch_to = match site {
+        HomeSite::Pornhub => "xhamster",
+        HomeSite::Xhamster => "pornhub",
+    };
     [
         ("↑↓", "move"),
         ("enter", "watch"),
         ("tab", "feed"),
         ("c", "channel"),
         ("/", "search"),
-        ("x", "xhamster"),
+        ("x", switch_to),
         ("b", "browse"),
         ("q", "quit"),
     ]
@@ -1971,7 +2018,7 @@ mod tests {
     #[test]
     fn home_shows_every_feed_in_the_bar() {
         let screen = render_feed(&mut App::headless(), FeedKind::Recommendations, 140, 40);
-        assert!(screen.contains("Home · Recommendations"), "{screen}");
+        assert!(screen.contains("Pornhub · Recommendations"), "{screen}");
         for feed in FeedKind::ALL {
             assert!(
                 screen.contains(feed.label()),
@@ -1983,6 +2030,22 @@ mod tests {
         assert!(screen.contains("A recommended video"), "{screen}");
         assert!(screen.contains("c channel"), "missing c hint: {screen}");
         assert!(screen.contains("x xhamster"), "missing x hint: {screen}");
+    }
+
+    #[test]
+    fn x_toggles_the_home_site_and_its_hint() {
+        let mut app = App::headless();
+        app.site = HomeSite::Xhamster;
+        let screen = render_feed(&mut app, FeedKind::Recommendations, 140, 40);
+        assert!(screen.contains("XHamster · Recommendations"), "{screen}");
+        assert!(
+            screen.contains("x pornhub"),
+            "missing toggle hint: {screen}"
+        );
+        assert!(
+            !screen.contains("x xhamster"),
+            "stale toggle hint: {screen}"
+        );
     }
 
     #[test]

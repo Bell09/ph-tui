@@ -32,8 +32,9 @@ Rust. The interface is built with `ratatui`, previews use `ratatui-image`, and
   scrollbar, all in-process
 - **Home feeds** — a feed bar with Recommendations, Hottest, Most Viewed, Newest
   and Top Rated; each feed loads real videos with inline previews
-- **Categories and search** — fetch from the site directly, page through results
-- **xHamster search** — press `x` from home to search xHamster and play its results
+- **Categories and search** — fetch from the active site directly, page through results
+- **Site toggle** — press `x` on home to switch the feed bar between PornHub and
+  xHamster; press it again to go back to PornHub
 - **Channel browsing** — press `c` on a video to open its uploader/channel in the TUI
 - **Playback** — hand the watch page to `mpv`, which resolves the stream through
   `yt-dlp`; playback is always capped at 320p
@@ -117,7 +118,7 @@ Run `ph-tui` in a terminal. The home screen opens straight into the
 **Recommendations** feed (the personalized front page) and shows a feed bar:
 
 ```
- ◆ ph-tui  ›  Home · Recommendations                 v0.1.0
+ ◆ ph-tui  ›  Pornhub · Recommendations              v0.1.0
 ────────────────────────────────────────────────────────────────────────────────
  r Recommendations  ·  h Hottest  ·  v Most Viewed  ·  n Newest  ·  t Top Rated  ·  b Browse categories
  Recommendations
@@ -136,11 +137,13 @@ Run `ph-tui` in a terminal. The home screen opens straight into the
 | `Enter` | Watch the selected video; `>>> Next page` works on ordered feeds |
 | `Ctrl-D` / `Ctrl-O` | Download / open the selected video in a browser |
 | `c` | Open the selected video's uploader/channel |
-| `b` / `1` | Browse categories |
-| `/` | Search videos |
-| `x` | xHamster search |
+| `b` / `1` | Browse the active site's categories |
+| `/` | Search the active site |
+| `x` | Toggle between PornHub and xHamster home feeds |
 | `q` | Quit |
 
+`x` reloads the Recommendations feed for the new site; the feed bar, categories,
+search and channel links all follow it. Press `x` again to return to PornHub.
 The front page does not paginate; the four ordered feeds do. `2` / `u` still
 check for updates from the home screen, but the update check is not in the bar.
 

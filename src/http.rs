@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
@@ -109,11 +109,82 @@ pub fn feed_videos(feed: FeedKind, page: u32) -> Result<Vec<Video>> {
     Ok(videos_from_html(&html))
 }
 
+/// xHamster equivalents of the home feed bar. The site calls its front page
+/// "Trending" and exposes ordered pages through `/newest` and `/best`; weekly
+/// and monthly best lists stand in for the two ranking feeds PornHub provides.
+pub fn xhamster_feed_videos(feed: FeedKind, page: u32) -> Result<Vec<Video>> {
+    let html = get_html(&xhamster_feed_url(feed, page))?;
+    Ok(xhamster_videos_from_html(&html))
+}
+
+fn xhamster_feed_url(feed: FeedKind, page: u32) -> String {
+    let base = match feed {
+        FeedKind::Recommendations => BASE_XHAMSTER.to_string(),
+        FeedKind::Hottest => format!("{BASE_XHAMSTER}/best/weekly"),
+        FeedKind::MostViewed => format!("{BASE_XHAMSTER}/best"),
+        FeedKind::Newest => format!("{BASE_XHAMSTER}/newest"),
+        FeedKind::TopRated => format!("{BASE_XHAMSTER}/best/monthly"),
+    };
+    if feed.paginated() && page > 1 {
+        format!("{base}/{page}")
+    } else {
+        base
+    }
+}
+
 /// Videos listed for a category.
 pub fn category_videos(category_id: &str, page: u32) -> Result<Vec<Video>> {
     let url = format!("{BASE}/video?c={category_id}&page={page}");
     let html = get_html(&url)?;
     Ok(videos_from_html(&html))
+}
+
+/// Categories from xHamster's own index, prettified and sorted like PornHub's.
+pub fn xhamster_categories() -> Result<Vec<Category>> {
+    let html = get_html(&format!("{BASE_XHAMSTER}/categories"))?;
+    let document = Html::parse_document(&html);
+    let selector = Selector::parse("a[href]").expect("static selector is valid");
+    let mut seen = HashSet::new();
+    let mut categories = Vec::new();
+
+    for anchor in document.select(&selector) {
+        let Some(href) = anchor.value().attr("href") else {
+            continue;
+        };
+        let Some(raw_path) = href_path(href) else {
+            continue;
+        };
+        let path = clean_path(&raw_path);
+        let Some(slug) = path.strip_prefix("/categories/") else {
+            continue;
+        };
+        let id = slug.split('/').next().unwrap_or("");
+        if id.is_empty() || !seen.insert(id.to_string()) {
+            continue;
+        }
+        let name = anchor_name(&anchor);
+        if !name.is_empty() {
+            categories.push(Category {
+                id: id.to_string(),
+                name,
+            });
+        }
+    }
+
+    categories.sort_by_key(|category| category.name.to_lowercase());
+    Ok(categories)
+}
+
+/// Videos listed for an xHamster category. Ordered pages use a `/N` suffix.
+pub fn xhamster_category_videos(category_id: &str, page: u32) -> Result<Vec<Video>> {
+    let base = format!("{BASE_XHAMSTER}/categories/{category_id}");
+    let url = if page > 1 {
+        format!("{base}/{page}")
+    } else {
+        base
+    };
+    let html = get_html(&url)?;
+    Ok(xhamster_videos_from_html(&html))
 }
 
 /// Search results (PornHub). The site already ranks matches, so its order
@@ -873,6 +944,30 @@ mod tests {
         assert_eq!(og_image(r#"<meta property="og:image" content="  ">"#), None);
     }
 
+    #[test]
+    fn xhamster_feed_urls_match_the_site_bar() {
+        assert_eq!(
+            xhamster_feed_url(FeedKind::Recommendations, 4),
+            "https://xhamster.desi"
+        );
+        assert_eq!(
+            xhamster_feed_url(FeedKind::Hottest, 1),
+            "https://xhamster.desi/best/weekly"
+        );
+        assert_eq!(
+            xhamster_feed_url(FeedKind::MostViewed, 2),
+            "https://xhamster.desi/best/2"
+        );
+        assert_eq!(
+            xhamster_feed_url(FeedKind::Newest, 3),
+            "https://xhamster.desi/newest/3"
+        );
+        assert_eq!(
+            xhamster_feed_url(FeedKind::TopRated, 1),
+            "https://xhamster.desi/best/monthly"
+        );
+    }
+
     /// Hits the real site; run with `cargo test -- --ignored`.
     #[test]
     #[ignore]
@@ -891,10 +986,34 @@ mod tests {
     /// Hits the real site; run with `cargo test -- --ignored`.
     #[test]
     #[ignore]
+    fn live_xhamster_home_feeds() {
+        for feed in FeedKind::ALL {
+            let videos = xhamster_feed_videos(feed, 1).expect("xHamster home feed request");
+            assert!(!videos.is_empty(), "{} was empty", feed.label());
+            assert!(
+                videos.iter().any(|video| video.preview.is_some()),
+                "{} carried no thumbnails",
+                feed.label()
+            );
+        }
+    }
+
+    /// Hits the real site; run with `cargo test -- --ignored`.
+    #[test]
+    #[ignore]
     fn live_categories() {
         let categories = categories().expect("categories request");
         assert!(!categories.is_empty());
         assert!(categories.iter().any(|c| c.name == "Big Tits"));
+    }
+
+    /// Hits the real site; run with `cargo test -- --ignored`.
+    #[test]
+    #[ignore]
+    fn live_xhamster_categories() {
+        let categories = xhamster_categories().expect("xHamster categories request");
+        assert!(!categories.is_empty());
+        assert!(categories.iter().any(|category| category.name == "Asian"));
     }
 
     /// Hits the real site; run with `cargo test -- --ignored`.
