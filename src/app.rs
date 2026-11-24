@@ -1852,10 +1852,16 @@ fn hints_line(theme: &Theme, hints: &[(&str, &str)]) -> Line<'static> {
 }
 
 fn body_layout(area: Rect) -> (Rect, Rect) {
-    if area.width >= 100 {
-        // Give the preview pane a larger share so the image is noticeably
-        // bigger while the list keeps most of the width.
-        let chunks = Layout::horizontal([Constraint::Percentage(52), Constraint::Percentage(48)])
+    if area.width >= 120 {
+        // The recommendation list is the primary column: give titles room to
+        // breathe and leave the preview a compact, still-usable pane.
+        let chunks = Layout::horizontal([Constraint::Percentage(68), Constraint::Percentage(32)])
+            .split(area);
+        (chunks[0], chunks[1])
+    } else if area.width >= 100 {
+        // On narrower screens keep a little more of the preview, but still
+        // favor the list.
+        let chunks = Layout::horizontal([Constraint::Percentage(60), Constraint::Percentage(40)])
             .split(area);
         (chunks[0], chunks[1])
     } else {
@@ -2174,6 +2180,21 @@ mod tests {
             screen.contains("type to filter") || screen.contains("a"),
             "{screen}"
         );
+    }
+
+    #[test]
+    fn wide_layout_favors_the_recommendation_column() {
+        let (list, preview) = body_layout(Rect::new(0, 0, 160, 40));
+        assert!(list.width > preview.width * 2, "{list:?} {preview:?}");
+
+        let (list, preview) = body_layout(Rect::new(0, 0, 110, 40));
+        assert!(list.width > preview.width, "{list:?} {preview:?}");
+
+        // Below the split threshold the panes stack, so the full width is
+        // shared by both instead of being squeezed horizontally.
+        let (list, preview) = body_layout(Rect::new(0, 0, 80, 40));
+        assert_eq!(list.width, 80);
+        assert_eq!(preview.width, 80);
     }
 
     #[test]
