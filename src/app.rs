@@ -16,7 +16,7 @@ use ratatui::widgets::{
 use ratatui::Frame;
 use ratatui_image::picker::Picker;
 use ratatui_image::protocol::StatefulProtocol;
-use ratatui_image::{FilterType, Resize, StatefulImage};
+use ratatui_image::{Resize, StatefulImage};
 use unicode_width::UnicodeWidthChar;
 
 type Term = ratatui::DefaultTerminal;
@@ -149,13 +149,7 @@ fn item_watch_url(item: &Item) -> String {
 enum ThumbState {
     Idle,
     Loading,
-    /// Keep the decoded image so it can be refitted when the pane resizes.
-    /// The protocol is cached per render area to avoid re-encoding each frame.
-    Ready {
-        image: DynamicImage,
-        protocol: Box<StatefulProtocol>,
-        area: Option<Rect>,
-    },
+    Ready(Box<StatefulProtocol>),
     Failed,
 }
 
@@ -245,12 +239,7 @@ impl Thumb {
         match received {
             Some((key, Ok(Ok(image)))) => {
                 if self.target.as_deref() == Some(key.as_str()) {
-                    let protocol = picker.new_resize_protocol(image.clone());
-                    self.state = ThumbState::Ready {
-                        image,
-                        protocol: Box::new(protocol),
-                        area: None,
-                    };
+                    self.state = ThumbState::Ready(Box::new(picker.new_resize_protocol(image)));
                     changed = true;
                 }
                 self.rx = None;
@@ -1381,7 +1370,7 @@ impl App {
         }
 
         let caption_rows = lines.len() as u16;
-        let mut body = inner;
+        let mut body = Rect::new(inner.x, inner.y, inner.width, caption_rows);
 
         if is_video {
             if matches!(self.thumb.state, ThumbState::Loading) {
@@ -1396,23 +1385,20 @@ impl App {
                     inner.x,
                     inner.y + 1,
                     inner.width,
-                    inner.height.saturating_sub(1),
+                    caption_rows.min(inner.height.saturating_sub(1)),
                 );
-            } else if let Some(preview) = preview_area(inner, caption_rows) {
-                if let Some(protocol) =
-                    filled_preview_protocol(&self.picker, &mut self.thumb.state, preview)
-                {
+            } else if let ThumbState::Ready(protocol) = &mut self.thumb.state {
+                let rows = preview_rows(inner, caption_rows);
+                if rows > 0 {
+                    // Same fixed 16:9 shape as before. Scale fills this box
+                    // exactly instead of Fit's padded, smaller drawing.
+                    let preview = Rect::new(inner.x, inner.y, inner.width, rows);
                     frame.render_stateful_widget(
                         StatefulImage::new().resize(Resize::Scale(None)),
                         preview,
-                        protocol,
+                        protocol.as_mut(),
                     );
-                    body = Rect::new(
-                        inner.x,
-                        inner.y + preview.height,
-                        inner.width,
-                        inner.height.saturating_sub(preview.height),
-                    );
+                    body = Rect::new(inner.x, inner.y + rows, inner.width, caption_rows);
                 }
             }
         }
@@ -1982,44 +1968,18 @@ fn row_line(
 
 const MIN_PREVIEW_ROWS: u16 = 4;
 
-/// Give the image every row the caption does not need. The caption is exact,
-/// so no blank rows are left between the artwork and the text or below it.
-fn preview_area(inner: Rect, caption_rows: u16) -> Option<Rect> {
-    let rows = inner.height.checked_sub(caption_rows)?;
-    if rows < MIN_PREVIEW_ROWS {
-        return None;
+/// Keep every preview at the same 16:9 shape. The image fills this box with
+/// `Resize::Scale`, so there is no letterbox padding inside it, but it never
+/// grows to fill the rest of the pane.
+fn preview_rows(inner: Rect, caption_rows: u16) -> u16 {
+    let max = inner.height.saturating_sub(caption_rows);
+    if max < MIN_PREVIEW_ROWS {
+        return 0;
     }
-    Some(Rect::new(inner.x, inner.y, inner.width, rows))
-}
-
-/// Fit the decoded thumbnail to the exact render area. `resize_to_fill`
-/// preserves the image's proportions and crops the overflow, so `Scale` draws
-/// it edge to edge without letterbox padding. Re-encode only on area changes.
-fn filled_preview_protocol<'a>(
-    picker: &Picker,
-    state: &'a mut ThumbState,
-    area: Rect,
-) -> Option<&'a mut StatefulProtocol> {
-    match state {
-        ThumbState::Ready {
-            image,
-            protocol,
-            area: cached,
-        } => {
-            if *cached != Some(area) {
-                let (font_width, font_height) = picker.font_size();
-                let width = u32::from(area.width) * u32::from(font_width);
-                let height = u32::from(area.height) * u32::from(font_height);
-                if width > 0 && height > 0 {
-                    let fitted = image.resize_to_fill(width, height, FilterType::Triangle);
-                    **protocol = picker.new_resize_protocol(fitted);
-                    *cached = Some(area);
-                }
-            }
-            Some(protocol.as_mut())
-        }
-        _ => None,
-    }
+    // Terminal cells are roughly twice as tall as they are wide, so this is
+    // the row count for a 16:9 image spanning the pane width.
+    let by_width = (u32::from(inner.width) * 9 / 32) as u16;
+    by_width.clamp(MIN_PREVIEW_ROWS, max).min(28)
 }
 
 fn render_too_small(frame: &mut Frame, theme: &Theme, area: Rect) {
@@ -2236,20 +2196,17 @@ mod tests {
     }
 
     #[test]
-    fn preview_fills_rows_left_by_the_caption() {
-        let inner = Rect::new(0, 0, 64, 35);
-        let preview = preview_area(inner, 5).expect("room for a preview");
-        assert_eq!(preview.x, inner.x);
-        assert_eq!(preview.y, inner.y);
-        assert_eq!(preview.width, inner.width);
-        assert_eq!(preview.height, 30);
-
-        // Too short for the minimum image strip: fall back to caption only.
-        assert!(preview_area(Rect::new(0, 0, 64, 8), 5).is_none());
+    fn preview_keeps_a_fixed_sixteen_by_nine_shape() {
+        // Same width-driven size as before; the caption only caps it on short
+        // terminals instead of stretching the image into the whole pane.
+        assert_eq!(preview_rows(Rect::new(0, 0, 96, 48), 4), 27);
+        assert_eq!(preview_rows(Rect::new(0, 0, 96, 28), 4), 24);
+        assert_eq!(preview_rows(Rect::new(0, 0, 64, 35), 3), 18);
+        assert_eq!(preview_rows(Rect::new(0, 0, 64, 8), 5), 0);
     }
 
     #[test]
-    fn ready_preview_fills_the_pane_without_a_gap() {
+    fn ready_preview_fills_its_box_and_keeps_caption_tight() {
         let mut app = App::headless();
         let item = Item::new(Kind::Video, "abc", "Title");
         let image = DynamicImage::ImageRgba8(image::ImageBuffer::from_pixel(
@@ -2257,12 +2214,8 @@ mod tests {
             270,
             image::Rgba([20u8, 40, 60, 255]),
         ));
-        let protocol = app.picker.new_resize_protocol(image.clone());
-        app.thumb.state = ThumbState::Ready {
-            image,
-            protocol: Box::new(protocol),
-            area: None,
-        };
+        let protocol = app.picker.new_resize_protocol(image);
+        app.thumb.state = ThumbState::Ready(Box::new(protocol));
 
         let backend = TestBackend::new(64, 36);
         let mut term = Terminal::new(backend).unwrap();
@@ -2270,20 +2223,24 @@ mod tests {
             .unwrap();
 
         let buffer = term.backend().buffer();
-        // The title owns row 0. Of the 34 inner rows, three are caption, so
-        // rows 1..=31 must be completely covered by the image.
-        for y in 1..32 {
+        // Title owns row 0; the fixed 16:9 box is rows 1..=18 and the caption
+        // starts on row 19. Scale fills that box with no letterbox padding.
+        for y in 1..19 {
             let painted = (0..64)
                 .filter(|x| buffer[(*x, y)].bg != ratatui::style::Color::Reset)
                 .count();
             assert_eq!(painted, 64, "row {y} has a gap");
         }
         let caption: String = (0..64)
-            .map(|x| buffer[(x, 32)].symbol().to_string())
+            .map(|x| buffer[(x, 19)].symbol().to_string())
             .collect();
         assert!(
             caption.contains("VIDEO"),
             "caption is not tight under the image: {caption:?}"
+        );
+        assert!(
+            (0..64).all(|x| buffer[(x, 19)].bg == ratatui::style::Color::Reset),
+            "image grew past its fixed box"
         );
     }
 
@@ -2318,12 +2275,7 @@ mod tests {
                 270,
                 image::Rgba([20u8, 40, 60, 255]),
             ));
-            let protocol = app.picker.new_resize_protocol(image.clone());
-            app.thumb.state = ThumbState::Ready {
-                image,
-                protocol: Box::new(protocol),
-                area: None,
-            };
+            app.thumb.state = ThumbState::Ready(Box::new(app.picker.new_resize_protocol(image)));
 
             let backend = TestBackend::new(width, height);
             let mut term = Terminal::new(backend).unwrap();
