@@ -14,10 +14,11 @@ use anyhow::{anyhow, bail, Context, Result};
 use image::DynamicImage;
 use ratatui_image::picker::Picker;
 
-/// Preview images are scaled to this box before rendering. 320x180 is ample
-/// for a sidebar and keeps the decoded RGBA buffer around 220 KiB per image.
-pub const PREVIEW_WIDTH: u32 = 320;
-pub const PREVIEW_HEIGHT: u32 = 180;
+/// Every preview is decoded to this exact 16:9 box before rendering, so the
+/// pane always shows the same compact shape. 480x270 keeps it sharp on wider
+/// terminals at roughly 500 KiB of decoded RGBA per image.
+pub const PREVIEW_WIDTH: u32 = 480;
+pub const PREVIEW_HEIGHT: u32 = 270;
 
 /// Keep the disk cache bounded by both entry count and total size. A corrupt
 /// or stale cache file is replaced on the next load instead of failing forever.
@@ -257,7 +258,7 @@ mod tests {
     #[test]
     fn every_source_lands_on_the_same_size() {
         for (width, height) in [
-            (320u32, 180u32),
+            (480u32, 270u32),
             (640, 360),
             (720, 404),
             (640, 480),

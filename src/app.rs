@@ -1853,15 +1853,15 @@ fn hints_line(theme: &Theme, hints: &[(&str, &str)]) -> Line<'static> {
 
 fn body_layout(area: Rect) -> (Rect, Rect) {
     if area.width >= 120 {
-        // The recommendation list is the primary column: give titles room to
-        // breathe and leave the preview a compact, still-usable pane.
-        let chunks = Layout::horizontal([Constraint::Percentage(68), Constraint::Percentage(32)])
+        // Keep the recommendation list primary, but give the uniformly sized
+        // preview a compact 40% so the image stays comfortably readable.
+        let chunks = Layout::horizontal([Constraint::Percentage(60), Constraint::Percentage(40)])
             .split(area);
         (chunks[0], chunks[1])
     } else if area.width >= 100 {
-        // On narrower screens keep a little more of the preview, but still
-        // favor the list.
-        let chunks = Layout::horizontal([Constraint::Percentage(60), Constraint::Percentage(40)])
+        // Narrower screens still favor the list, with a slightly smaller
+        // preview pane.
+        let chunks = Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)])
             .split(area);
         (chunks[0], chunks[1])
     } else {
@@ -1983,7 +1983,7 @@ fn preview_rows(inner: Rect) -> u16 {
     // Terminal cells are roughly twice as tall as they are wide, so this is
     // the row count for a 16:9 image spanning the pane width.
     let by_width = (inner.width as u32 * 9 / 32) as u16;
-    by_width.clamp(4, max).min(24)
+    by_width.clamp(4, max).min(28)
 }
 
 fn render_too_small(frame: &mut Frame, theme: &Theme, area: Rect) {
@@ -2185,10 +2185,12 @@ mod tests {
     #[test]
     fn wide_layout_favors_the_recommendation_column() {
         let (list, preview) = body_layout(Rect::new(0, 0, 160, 40));
-        assert!(list.width > preview.width * 2, "{list:?} {preview:?}");
+        assert!(list.width > preview.width, "{list:?} {preview:?}");
+        assert!(preview.width >= 64, "preview shrank: {preview:?}");
 
         let (list, preview) = body_layout(Rect::new(0, 0, 110, 40));
         assert!(list.width > preview.width, "{list:?} {preview:?}");
+        assert!(preview.width >= 49, "preview shrank: {preview:?}");
 
         // Below the split threshold the panes stack, so the full width is
         // shared by both instead of being squeezed horizontally.
@@ -2198,10 +2200,10 @@ mod tests {
     }
 
     #[test]
-    fn preview_uses_more_of_the_details_pane() {
-        // A 96-column pane should get a 24-row 16:9 preview, not the old
-        // 16-row cap, and only four rows are reserved for the caption.
-        assert_eq!(preview_rows(Rect::new(0, 0, 96, 48)), 24);
+    fn preview_scales_with_the_pane_width() {
+        // A 96-column pane gets a 27-row 16:9 preview; height only caps it on
+        // shorter terminals, and four rows stay reserved for the caption.
+        assert_eq!(preview_rows(Rect::new(0, 0, 96, 48)), 27);
         assert_eq!(preview_rows(Rect::new(0, 0, 96, 28)), 24);
         // Too short for a preview plus caption: leave it to the text.
         assert_eq!(preview_rows(Rect::new(0, 0, 96, 7)), 0);
