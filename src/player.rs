@@ -1,33 +1,35 @@
 //! Playback, downloads and browser hand-off, all through external tools.
 //!
-//! Nothing here talks to the TUI: the caller restores the terminal before
-//! invoking these and re-enters the alternate screen afterwards.
+//! Playback hands the terminal to `mpv`. Downloads stay in the background and
+//! report progress over a channel, so the TUI never leaves the alternate screen.
 
 use std::fs;
+use std::io::Read;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::sync::mpsc::{self, Receiver};
+use std::thread;
 
 use crate::model::watch_url;
 
+/// Progress updates from a background `yt-dlp` download.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DownloadEvent {
+    Progress(u8),
+    Done(bool),
+}
+
 /// Stream a video through mpv, which resolves the stream with yt-dlp itself.
 ///
-/// `mpv` is launched without `--really-quiet` so that stream-resolution errors
-/// (for example an expired yt-dlp extractor) are visible instead of the player
-/// exiting silently. `--force-window=yes` makes the window appear immediately,
-/// giving feedback while yt-dlp resolves the URL.
-pub fn play(title: &str, identifier: &str) -> bool {
+/// The alternate screen stays active and mpv's output is silenced, so only the
+/// mpv window is visible. `--force-window=yes` makes it appear immediately.
+pub fn play(identifier: &str) -> bool {
     let url = source_url(identifier);
 
-    println!();
-    println!("  ▶ {title}");
-    println!("  opening mpv · press q there to come back");
-    println!();
-
-    let started = Instant::now();
-    let status = Command::new("mpv")
+    Command::new("mpv")
         .args([
             "--force-window=yes",
+            "--really-quiet",
             "--profile=fast",
             "--hwdec=auto",
             "--cache=yes",
@@ -36,44 +38,29 @@ pub fn play(title: &str, identifier: &str) -> bool {
             "--ytdl-raw-options=cookies-from-browser=firefox",
         ])
         .arg(&url)
-        .status();
-
-    match status {
-        Err(error) => {
-            eprintln!("  could not launch mpv: {error}");
-            wait(Duration::from_secs(2));
-            false
-        }
-        Ok(_) => started.elapsed() >= Duration::from_secs(5),
-    }
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
 }
 
-/// Download through yt-dlp into `$XDG_VIDEOS_DIR/ph-tui`.
-pub fn download(title: &str, identifier: &str, quality: u8) -> bool {
+/// Start a download without touching the terminal. Progress and completion are
+/// delivered back to the TUI through the returned channel.
+pub fn spawn_download(identifier: &str, quality: u8) -> Result<Receiver<DownloadEvent>, String> {
     let url = source_url(identifier);
     let directory = download_dir();
+    fs::create_dir_all(&directory)
+        .map_err(|error| format!("could not create {}: {error}", directory.display()))?;
 
-    if let Err(error) = fs::create_dir_all(&directory) {
-        eprintln!("  could not create {}: {error}", directory.display());
-        wait(Duration::from_secs(2));
-        return false;
-    }
-
-    let (format, label) = match quality {
-        2 => ("bestvideo[height<=720]+bestaudio/best[height<=720]", "720p"),
-        3 => ("bestvideo[height<=480]+bestaudio/best[height<=480]", "480p"),
-        4 => ("bestvideo[height<=360]+bestaudio/best[height<=360]", "360p"),
-        _ => ("bestvideo+bestaudio/best", "best"),
+    let format = match quality {
+        2 => "bestvideo[height<=720]+bestaudio/best[height<=720]",
+        3 => "bestvideo[height<=480]+bestaudio/best[height<=480]",
+        4 => "bestvideo[height<=360]+bestaudio/best[height<=360]",
+        _ => "bestvideo+bestaudio/best",
     };
-
-    println!();
-    println!("  ↓ {title}");
-    println!("  quality: {label}");
-    println!("  into:    {}", directory.display());
-    println!();
-
     let output_template = format!("{}/%(title)s.%(ext)s", directory.display());
-    let status = Command::new("yt-dlp")
+
+    let mut child = Command::new("yt-dlp")
         .args([
             "--cookies-from-browser=firefox",
             "-f",
@@ -84,22 +71,61 @@ pub fn download(title: &str, identifier: &str, quality: u8) -> bool {
             "--progress",
             &url,
         ])
-        .status();
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("could not launch yt-dlp: {error}"))?;
 
-    match status {
-        Ok(status) if status.success() => {
-            println!();
-            println!("  download complete · {}", directory.display());
-            wait(Duration::from_millis(800));
-            true
+    let (tx, rx) = mpsc::channel();
+    let mut stderr = child.stderr.take().expect("stderr is piped");
+    thread::spawn(move || {
+        let mut chunk = [0u8; 4096];
+        let mut line: Vec<u8> = Vec::new();
+        let mut last = None;
+
+        // yt-dlp rewrites progress with carriage returns, so split on both CR
+        // and LF instead of waiting for a newline that may never arrive.
+        loop {
+            let read = match stderr.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(read) => read,
+            };
+            for byte in &chunk[..read] {
+                if *byte == b'\r' || *byte == b'\n' {
+                    emit_progress(&line, &mut last, &tx);
+                    line.clear();
+                } else {
+                    line.push(*byte);
+                }
+            }
         }
-        _ => {
-            println!();
-            println!("  download failed · the video may be unavailable or restricted");
-            wait(Duration::from_secs(2));
-            false
-        }
+        emit_progress(&line, &mut last, &tx);
+
+        let ok = child.wait().is_ok_and(|status| status.success());
+        let _ = tx.send(DownloadEvent::Done(ok));
+    });
+
+    Ok(rx)
+}
+
+fn emit_progress(line: &[u8], last: &mut Option<u8>, tx: &mpsc::Sender<DownloadEvent>) {
+    let text = String::from_utf8_lossy(line);
+    let Some(percent) = parse_percent(&text) else {
+        return;
+    };
+    if *last != Some(percent) {
+        let _ = tx.send(DownloadEvent::Progress(percent));
+        *last = Some(percent);
     }
+}
+
+fn parse_percent(line: &str) -> Option<u8> {
+    let sign = line.find('%')?;
+    let token = line[..sign].split_whitespace().last()?;
+    token
+        .parse::<f32>()
+        .ok()
+        .map(|value| value.round().clamp(0.0, 100.0) as u8)
 }
 
 /// Open the watch page in the system browser.
@@ -135,6 +161,14 @@ fn download_dir() -> PathBuf {
         .join("ph-tui")
 }
 
-fn wait(duration: Duration) {
-    std::thread::sleep(duration);
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_ytdlp_progress_lines() {
+        assert_eq!(parse_percent("[download]  12.3% of 10.00MiB"), Some(12));
+        assert_eq!(parse_percent("[download] 100% of 10.00MiB"), Some(100));
+        assert_eq!(parse_percent("[download] Downloading item 1 of 2"), None);
+    }
 }

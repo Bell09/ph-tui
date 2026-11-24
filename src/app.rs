@@ -89,6 +89,12 @@ struct Toast {
     at: Instant,
 }
 
+struct DownloadJob {
+    label: String,
+    rx: Receiver<player::DownloadEvent>,
+    percent: u8,
+}
+
 enum UpdateState {
     Checking,
     Disabled,
@@ -270,6 +276,7 @@ pub struct App {
     update: UpdateState,
     update_rx: Option<Receiver<Option<String>>>,
     toast: Option<Toast>,
+    downloads: Vec<DownloadJob>,
     last_query: String,
     visible_rows: usize,
 }
@@ -309,6 +316,7 @@ impl App {
             update,
             update_rx,
             toast,
+            downloads: Vec::new(),
             last_query: String::new(),
             visible_rows: 10,
         }
@@ -361,6 +369,51 @@ impl App {
             self.toast = None;
         }
         expired
+    }
+
+    /// Drain background download events. Progress is shown live in the status
+    /// row; the final event becomes a normal in-app toast.
+    fn poll_downloads(&mut self) -> bool {
+        let mut changed = false;
+        let mut index = 0;
+        while index < self.downloads.len() {
+            let mut finished = false;
+            loop {
+                match self.downloads[index].rx.try_recv() {
+                    Ok(player::DownloadEvent::Progress(percent)) => {
+                        if self.downloads[index].percent != percent {
+                            self.downloads[index].percent = percent;
+                            changed = true;
+                        }
+                    }
+                    Ok(player::DownloadEvent::Done(ok)) => {
+                        let label = self.downloads[index].label.clone();
+                        if ok {
+                            self.set_toast(format!("download complete · {label}"), Tone::Success);
+                        } else {
+                            self.set_toast(format!("download failed · {label}"), Tone::Error);
+                        }
+                        self.downloads.remove(index);
+                        changed = true;
+                        finished = true;
+                        break;
+                    }
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        let label = self.downloads[index].label.clone();
+                        self.set_toast(format!("download failed · {label}"), Tone::Error);
+                        self.downloads.remove(index);
+                        changed = true;
+                        finished = true;
+                        break;
+                    }
+                }
+            }
+            if !finished {
+                index += 1;
+            }
+        }
+        changed
     }
 
     /// Returns true when a background update check delivered a result.
@@ -523,6 +576,7 @@ impl App {
             loop {
                 let changed = self.poll_update()
                     | self.poll_theme()
+                    | self.poll_downloads()
                     | self.thumb.sync(list.selected())
                     | self.thumb.poll(&self.picker)
                     | self.expire_toast();
@@ -593,9 +647,8 @@ impl App {
                             next = Some((active, page));
                             break;
                         }
-                        let title = item.label.clone();
                         let url = item_watch_url(&item);
-                        self.play(term, &title, &url)?;
+                        self.play(term, &url)?;
                     }
                     _ => {}
                 }
@@ -765,9 +818,8 @@ impl App {
                                 refetch = true;
                             }
                             _ => {
-                                let title = item.label.clone();
                                 let url = item_watch_url(item);
-                                self.play(term, &title, &url)?;
+                                self.play(term, &url)?;
                             }
                         }
                     }
@@ -832,7 +884,7 @@ impl App {
         let title = item.label.clone();
         let url = item_watch_url(item);
         if let Some(quality) = self.choose_quality(term, &title)? {
-            self.download(term, &title, &url, quality)?;
+            self.start_download(&title, &url, quality);
         }
         Ok(())
     }
@@ -851,10 +903,14 @@ impl App {
         }
     }
 
-    fn play(&mut self, term: &mut Term, title: &str, identifier: &str) -> Result<()> {
-        ratatui::restore();
-        let ok = player::play(title, identifier);
-        *term = ratatui::init();
+    fn play(&mut self, term: &mut Term, identifier: &str) -> Result<()> {
+        // Stay in the alternate screen so the shell never flashes back into
+        // view. Raw mode is dropped only long enough for mpv to read keys.
+        let suspended = crossterm::terminal::disable_raw_mode();
+        let ok = player::play(identifier);
+        if suspended.is_ok() {
+            let _ = crossterm::terminal::enable_raw_mode();
+        }
         term.clear()?;
         self.thumb.reset();
         if ok {
@@ -865,24 +921,15 @@ impl App {
         Ok(())
     }
 
-    fn download(
-        &mut self,
-        term: &mut Term,
-        title: &str,
-        identifier: &str,
-        quality: u8,
-    ) -> Result<()> {
-        ratatui::restore();
-        let ok = player::download(title, identifier, quality);
-        *term = ratatui::init();
-        term.clear()?;
-        self.thumb.reset();
-        if ok {
-            self.set_toast("Download complete", Tone::Success);
-        } else {
-            self.set_toast("Download failed", Tone::Error);
+    fn start_download(&mut self, title: &str, identifier: &str, quality: u8) {
+        match player::spawn_download(identifier, quality) {
+            Ok(rx) => self.downloads.push(DownloadJob {
+                label: title.to_string(),
+                rx,
+                percent: 0,
+            }),
+            Err(error) => self.set_toast(error, Tone::Error),
         }
-        Ok(())
     }
 
     fn update_screen(&mut self, term: &mut Term) -> Result<()> {
@@ -890,6 +937,7 @@ impl App {
         loop {
             self.poll_update();
             self.poll_theme();
+            self.poll_downloads();
             term.draw(|frame| self.render_update(frame, tick))?;
             tick = tick.wrapping_add(1);
 
@@ -923,6 +971,7 @@ impl App {
         loop {
             let changed = self.poll_update()
                 | self.poll_theme()
+                | self.poll_downloads()
                 | self.thumb.sync(list.selected())
                 | self.thumb.poll(&self.picker)
                 | self.expire_toast();
@@ -987,7 +1036,10 @@ impl App {
         self.thumb.reset();
 
         loop {
-            let changed = self.poll_update() | self.poll_theme() | self.expire_toast();
+            let changed = self.poll_update()
+                | self.poll_theme()
+                | self.poll_downloads()
+                | self.expire_toast();
             if dirty || changed {
                 term.draw(|frame| self.render_input(frame, title, hint, &chars, cursor))?;
                 dirty = false;
@@ -1062,6 +1114,7 @@ impl App {
         loop {
             self.poll_update();
             self.poll_theme();
+            self.poll_downloads();
             match receiver.try_recv() {
                 Ok(Ok(value)) => return Ok(Some(value)),
                 Ok(Err(error)) => {
@@ -1130,9 +1183,6 @@ impl App {
             hints.push(("c", "channel"));
         }
         hints.extend_from_slice(extra);
-        if filterable {
-            hints.push(("type", "filter"));
-        }
         hints.push(("esc", "back"));
         hints.push(("ctrl-c", "quit"));
         self.render_status(frame, chunks[4], &status, &hints);
@@ -1206,20 +1256,12 @@ impl App {
         }
 
         let mut rows_area = inner;
-        if filterable && inner.height >= 2 {
-            let mut spans = vec![Span::styled("⌕ ", Style::default().fg(theme.accent))];
-            if list.filter.is_empty() {
-                spans.push(Span::styled(
-                    "type to filter",
-                    Style::default().fg(theme.faint),
-                ));
-            } else {
-                spans.push(Span::styled(
-                    list.filter.clone(),
-                    Style::default().fg(theme.text),
-                ));
-                spans.push(Span::styled("▏", Style::default().fg(theme.accent)));
-            }
+        if filterable && !list.filter.is_empty() && inner.height >= 2 {
+            let spans = vec![
+                Span::styled("⌕ ", Style::default().fg(theme.accent)),
+                Span::styled(list.filter.clone(), Style::default().fg(theme.text)),
+                Span::styled("▏", Style::default().fg(theme.accent)),
+            ];
             frame.render_widget(
                 Paragraph::new(Line::from(spans)),
                 Rect::new(inner.x, inner.y, inner.width, 1),
@@ -1455,7 +1497,17 @@ impl App {
     /// Status on the left, keybind guide on the right — one utui-style row.
     fn render_status(&self, frame: &mut Frame, area: Rect, fallback: &str, hints: &[(&str, &str)]) {
         let theme = self.theme;
-        let status = if let Some(toast) = self.active_toast() {
+        let status = if let Some(job) = self.downloads.last() {
+            let label = tui::truncate(&job.label, 28);
+            Line::from(vec![
+                Span::styled(" ↓ ", Style::default().fg(theme.accent)),
+                Span::styled(label, Style::default().fg(theme.text)),
+                Span::styled(
+                    format!(" {}%", job.percent),
+                    Style::default().fg(theme.accent),
+                ),
+            ])
+        } else if let Some(toast) = self.active_toast() {
             let color = match toast.tone {
                 Tone::Info => theme.warn,
                 Tone::Success => theme.success,
@@ -2167,15 +2219,42 @@ mod tests {
     }
 
     #[test]
-    fn filter_text_is_visible() {
+    fn download_progress_and_completion_stay_inside_the_app() {
+        let mut app = App::headless();
+        let (tx, rx) = mpsc::channel();
+        app.downloads.push(DownloadJob {
+            label: "Big Buck Bunny".to_string(),
+            rx,
+            percent: 0,
+        });
+
+        tx.send(player::DownloadEvent::Progress(42)).unwrap();
+        assert!(app.poll_downloads());
+        assert_eq!(app.downloads[0].percent, 42);
+        let mut list = List::new(vec![Item::new(Kind::Video, "abc", "Alpha")]);
+        let screen = render(&mut app, &mut list);
+        assert!(screen.contains("42%"), "{screen}");
+        assert!(screen.contains("Big Buck"), "{screen}");
+
+        tx.send(player::DownloadEvent::Done(true)).unwrap();
+        assert!(app.poll_downloads());
+        assert!(app.downloads.is_empty());
+        let toast = app.active_toast().expect("completion toast");
+        assert!(toast.text.contains("download complete"), "{}", toast.text);
+    }
+
+    #[test]
+    fn filter_hint_is_gone_but_active_filter_is_visible() {
         let mut app = App::headless();
         let mut list = List::new(vec![Item::new(Kind::Video, "abc", "Alpha")]);
+        let screen = render(&mut app, &mut list);
+        assert!(!screen.contains("type to filter"), "{screen}");
+        assert!(!screen.contains("type filter"), "{screen}");
+
         list.push_char('a');
         let screen = render(&mut app, &mut list);
-        assert!(
-            screen.contains("type to filter") || screen.contains("a"),
-            "{screen}"
-        );
+        assert!(screen.contains('a'), "{screen}");
+        assert!(!screen.contains("type to filter"), "{screen}");
     }
 
     #[test]

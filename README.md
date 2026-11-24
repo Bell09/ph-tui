@@ -10,7 +10,6 @@ Rust. The interface is built with `ratatui`, previews use `ratatui-image`, and
  ◆ ph-tui  ›  Search · big tits                    v0.1.0
 ────────────────────────────────────────────────────────────────────────────────
  Results                                   Preview
- ⌕ type to filter
  ▌ Big Tits Compilation            #a1b2c3  ▄▄▀▀▄▄▀▀▄▄▀▀▄▄▀▀▄▄▀▀▄▄▀▀▄▄
    Morning Routine                #d4e5f6  VIDEO
    Next page                               A very long video title
@@ -37,8 +36,11 @@ Rust. The interface is built with `ratatui`, previews use `ratatui-image`, and
   xHamster; press it again to go back to PornHub
 - **Channel browsing** — press `c` on a video to open its uploader/channel in the TUI
 - **Playback** — hand the watch page to `mpv`, which resolves the stream through
-  `yt-dlp`; playback is always capped at 320p
-- **Downloads** — pick best / 720p / 480p / 360p, written to `~/Videos/ph-tui`
+  `yt-dlp`; playback is always capped at 320p. The terminal stays hidden while
+  mpv is open
+- **Downloads** — pick best / 720p / 480p / 360p, written to `~/Videos/ph-tui`.
+  They run in the background; live percent and completion notifications stay in
+  ph-tui instead of taking over the terminal
 - **Browser hand-off** — open the current video with `xdg-open`
 - **Update check** — optional crates.io check shown in the header
 - **Live theming** — follows `pywal`, `wallust` or `matugen` palettes and
