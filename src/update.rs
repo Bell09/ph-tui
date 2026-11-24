@@ -20,14 +20,14 @@ pub fn spawn_check() -> Receiver<Option<String>> {
 }
 
 fn latest_version() -> Option<String> {
-    let client = reqwest::blocking::Client::builder()
-        .user_agent(format!("ph-tui/{VERSION} (update check)"))
-        .timeout(Duration::from_secs(4))
-        .build()
-        .ok()?;
+    // Share the process-wide client instead of building a second TLS stack
+    // just for the startup update check.
+    let client = crate::http::client().ok()?;
 
     let response = client
         .get(format!("https://crates.io/api/v1/crates/{CRATE_NAME}"))
+        .header("User-Agent", format!("ph-tui/{VERSION} (update check)"))
+        .timeout(Duration::from_secs(4))
         .send()
         .ok()?;
     if !response.status().is_success() {

@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use scraper::{ElementRef, Html, Selector};
 use serde::Deserialize;
 use serde_json::Value;
@@ -13,19 +13,78 @@ const BASE: &str = "https://www.pornhub.com";
 const USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 \
                           (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36";
 
-fn client() -> Result<reqwest::blocking::Client> {
-    reqwest::blocking::Client::builder()
-        .user_agent(USER_AGENT)
-        .timeout(Duration::from_secs(15))
-        .build()
-        .context("failed to build HTTP client")
+/// One client for the whole process. Reusing it keeps connections alive and
+/// avoids rebuilding TLS state for every feed, page and preview request.
+pub(crate) fn client() -> Result<&'static reqwest::blocking::Client> {
+    static CLIENT: OnceLock<std::result::Result<reqwest::blocking::Client, String>> =
+        OnceLock::new();
+    let built = CLIENT.get_or_init(|| {
+        reqwest::blocking::Client::builder()
+            .user_agent(USER_AGENT)
+            .timeout(Duration::from_secs(15))
+            // A handful of idle connections is plenty for one preview at a
+            // time; leaving the pool unbounded is pure resident memory.
+            .pool_max_idle_per_host(2)
+            .build()
+            .map_err(|error| error.to_string())
+    });
+    built
+        .as_ref()
+        .map_err(|error| anyhow!("failed to build HTTP client: {error}"))
 }
 
+/// A single timed-out read should not tear down the TUI or leave an empty
+/// screen. Retry the same URL a couple of times before giving up.
+const HTML_ATTEMPTS: usize = 3;
+
 fn get_html(url: &str) -> Result<String> {
-    let response = client()?
-        .get(url)
-        .send()
-        .with_context(|| format!("GET {url}"))?;
+    let mut last = anyhow!("no request was made for {url}");
+    for attempt in 0..HTML_ATTEMPTS {
+        match get_html_once(url, attempt > 0) {
+            Ok(html) => return Ok(html),
+            Err(error) => last = error,
+        }
+    }
+    Err(last)
+}
+
+fn get_html_once(url: &str, retry: bool) -> Result<String> {
+    let mut request = client()?.get(url);
+    if retry {
+        request = request
+            .header("Cache-Control", "no-cache")
+            .header("Pragma", "no-cache");
+    }
+    let response = request.send().with_context(|| format!("GET {url}"))?;
+    read_html(response, url)
+}
+
+/// Same retry policy for requests that need query parameters.
+fn get_html_query(url: &str, params: &[(&str, String)]) -> Result<String> {
+    let mut last = anyhow!("no request was made for {url}");
+    for attempt in 0..HTML_ATTEMPTS {
+        let mut request = match client() {
+            Ok(client) => client.get(url).query(params),
+            Err(error) => return Err(error),
+        };
+        if attempt > 0 {
+            request = request
+                .header("Cache-Control", "no-cache")
+                .header("Pragma", "no-cache");
+        }
+        match request
+            .send()
+            .with_context(|| format!("GET {url}"))
+            .and_then(|response| read_html(response, url))
+        {
+            Ok(html) => return Ok(html),
+            Err(error) => last = error,
+        }
+    }
+    Err(last)
+}
+
+fn read_html(response: reqwest::blocking::Response, url: &str) -> Result<String> {
     let status = response.status();
     if !status.is_success() {
         bail!("unexpected HTTP status {status} for {url}");
@@ -191,15 +250,8 @@ pub fn xhamster_category_videos(category_id: &str, page: u32) -> Result<Vec<Vide
 /// is kept as-is. No local title-keyword filtering.
 pub fn search_videos(query: &str, page: u32) -> Result<Vec<Video>> {
     let url = format!("{BASE}/video/search");
-    let response = client()?
-        .get(&url)
-        .query(&[("search", query), ("page", &page.to_string())])
-        .send()
-        .with_context(|| format!("GET {url}"))?;
-    if !response.status().is_success() {
-        bail!("unexpected HTTP status {} for {url}", response.status());
-    }
-    let html = response.text().context("failed to read response body")?;
+    let params = [("search", query.to_string()), ("page", page.to_string())];
+    let html = get_html_query(&url, &params)?;
     Ok(videos_from_html(&html))
 }
 
@@ -209,15 +261,8 @@ pub fn search_videos(query: &str, page: u32) -> Result<Vec<Video>> {
 /// are passed through reqwest so spaces and punctuation are encoded correctly.
 pub fn xhamster_search(query: &str, page: u32) -> Result<Vec<Video>> {
     let url = format!("{BASE_XHAMSTER}/search");
-    let response = client()?
-        .get(&url)
-        .query(&[("q", query), ("page", &page.to_string())])
-        .send()
-        .with_context(|| format!("GET {url}"))?;
-    if !response.status().is_success() {
-        bail!("unexpected HTTP status {} for {url}", response.status());
-    }
-    let html = response.text().context("failed to read response body")?;
+    let params = [("q", query.to_string()), ("page", page.to_string())];
+    let html = get_html_query(&url, &params)?;
     Ok(xhamster_videos_from_html(&html))
 }
 
@@ -305,7 +350,7 @@ fn collect_xhamster_videos(
         let Some(title) = title else {
             continue;
         };
-        let preview = preview_from_link(&link, images);
+        let preview = preview_from_link(&link, images, BASE_XHAMSTER);
         let channel = channel_from_link(&link, Site::Xhamster);
 
         if let Some(&index) = positions.get(&watch_url) {
@@ -442,7 +487,7 @@ fn collect_videos(
             continue;
         };
         let title = decode_entities(element.value().attr("title").unwrap_or("").trim());
-        let preview = preview_from_link(&element, images);
+        let preview = preview_from_link(&element, images, BASE);
         let channel = channel_from_link(&element, Site::Pornhub);
 
         if let Some(&index) = positions.get(&viewkey) {
@@ -603,19 +648,76 @@ fn entity_char(entity: &str) -> Option<char> {
 /// Most listing anchors wrap their `<img>` and expose the still frame on one
 /// of several data attributes. The signed `data-image` URLs are still images
 /// even when the path contains `.mp4`.
-fn preview_from_link(link: &ElementRef, images: &Selector) -> Option<String> {
+fn preview_from_link(link: &ElementRef, images: &Selector, base: &str) -> Option<String> {
     for image in link.select(images) {
-        for attribute in ["data-thumb_url", "data-image", "data-src", "src"] {
-            let Some(url) = image.value().attr(attribute) else {
+        for attribute in [
+            "data-thumb_url",
+            "data-image",
+            "data-src",
+            "srcset",
+            "data-srcset",
+            "src",
+        ] {
+            let Some(raw) = image.value().attr(attribute) else {
                 continue;
             };
-            let url = url.trim();
-            if url.starts_with("http") {
-                return Some(url.to_string());
+            let candidate = if attribute.ends_with("srcset") {
+                first_srcset_url(raw)
+            } else {
+                raw.trim()
+            };
+            if let Some(url) = absolute_preview_url(candidate, base) {
+                return Some(url);
             }
         }
     }
     None
+}
+
+/// Browsers list the smallest candidate first; picking it saves bandwidth and
+/// decode time because the TUI never needs a full-size still.
+fn first_srcset_url(srcset: &str) -> &str {
+    srcset
+        .split(',')
+        .next()
+        .and_then(|entry| entry.split_whitespace().next())
+        .unwrap_or("")
+        .trim()
+}
+
+/// Previews are occasionally served as protocol-relative or site-relative
+/// paths; leaving them unresolved was a common cause of a missing image.
+fn absolute_preview_url(raw: &str, base: &str) -> Option<String> {
+    let raw = raw.trim();
+    if raw.is_empty() || raw.starts_with("data:") {
+        return None;
+    }
+    if let Some(rest) = raw.strip_prefix("//") {
+        return Some(format!("https://{rest}"));
+    }
+    if raw.starts_with("http://") || raw.starts_with("https://") {
+        return Some(raw.to_string());
+    }
+    if raw.starts_with('/') {
+        return Some(format!("{}{raw}", base.trim_end_matches('/')));
+    }
+    Some(format!("{}/{raw}", base.trim_end_matches('/')))
+}
+
+/// `base` must be an origin, not a watch URL, or relative `og:image` paths get
+/// appended to the video slug and resolve to a 404.
+fn url_origin(url: &str) -> String {
+    let after_scheme = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .unwrap_or(url);
+    let host = after_scheme.split('/').next().unwrap_or(after_scheme);
+    let scheme = if url.starts_with("http://") {
+        "http"
+    } else {
+        "https"
+    };
+    format!("{scheme}://{host}")
 }
 
 fn viewkey_from_href(href: &str) -> Option<String> {
@@ -641,15 +743,29 @@ pub fn preview_url(identifier: &str) -> Result<String> {
     {
         return Ok(url);
     }
+    if no_preview_cache()
+        .lock()
+        .is_ok_and(|cache| cache.contains(identifier))
+    {
+        bail!("watch page for {identifier} has no preview image");
+    }
 
     let page_url = if identifier.starts_with("http") {
         identifier.to_string()
     } else {
         watch_url(identifier)
     };
+    let origin = url_origin(&page_url);
     let html = get_html(&page_url)?;
-    let url = og_image(&html)
-        .with_context(|| format!("watch page for {identifier} has no preview image"))?;
+    let Some(url) = og_image(&html).and_then(|raw| absolute_preview_url(&raw, &origin)) else {
+        if let Ok(mut cache) = no_preview_cache().lock() {
+            if cache.len() >= PREVIEW_CACHE_LIMIT {
+                cache.clear();
+            }
+            cache.insert(identifier.to_string());
+        }
+        bail!("watch page for {identifier} has no preview image");
+    };
 
     if let Ok(mut cache) = preview_cache().lock() {
         if cache.len() >= PREVIEW_CACHE_LIMIT {
@@ -667,6 +783,13 @@ fn preview_cache() -> &'static Mutex<HashMap<String, String>> {
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Watch pages without a usable image are expensive to retry, so remember
+/// them for the session instead of re-downloading the same megabyte each time.
+fn no_preview_cache() -> &'static Mutex<HashSet<String>> {
+    static CACHE: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
 /// Pull `og:image` out of a watch page.
 pub fn og_image(html: &str) -> Option<String> {
     let document = Html::parse_document(html);
@@ -674,6 +797,8 @@ pub fn og_image(html: &str) -> Option<String> {
         "meta[property=\"og:image\"]",
         "meta[name=\"og:image\"]",
         "meta[property=\"og:image:url\"]",
+        "meta[name=\"twitter:image\"]",
+        "meta[property=\"twitter:image\"]",
     ] {
         let selector = Selector::parse(pattern).expect("static selector is valid");
         for element in document.select(&selector) {
@@ -942,6 +1067,55 @@ mod tests {
 
         assert_eq!(og_image("<html><head></head></html>"), None);
         assert_eq!(og_image(r#"<meta property="og:image" content="  ">"#), None);
+    }
+
+    #[test]
+    fn resolves_every_preview_url_shape() {
+        let base = "https://www.pornhub.com";
+        assert_eq!(
+            absolute_preview_url("https://cdn.example/a.jpg", base).as_deref(),
+            Some("https://cdn.example/a.jpg")
+        );
+        assert_eq!(
+            absolute_preview_url("//cdn.example/a.jpg", base).as_deref(),
+            Some("https://cdn.example/a.jpg")
+        );
+        assert_eq!(
+            absolute_preview_url("/thumb/a.jpg", base).as_deref(),
+            Some("https://www.pornhub.com/thumb/a.jpg")
+        );
+        assert_eq!(
+            absolute_preview_url("thumb/a.jpg", base).as_deref(),
+            Some("https://www.pornhub.com/thumb/a.jpg")
+        );
+        assert_eq!(absolute_preview_url("data:image/png;base64,AA", base), None);
+        assert_eq!(absolute_preview_url("   ", base), None);
+    }
+
+    #[test]
+    fn picks_the_smallest_srcset_candidate() {
+        let srcset = "https://cdn.example/small.webp 526w, https://cdn.example/big.webp 1280w";
+        assert_eq!(first_srcset_url(srcset), "https://cdn.example/small.webp");
+        assert_eq!(
+            first_srcset_url("  https://cdn.example/only.jpg 1x "),
+            "https://cdn.example/only.jpg"
+        );
+    }
+
+    #[test]
+    fn relative_og_images_use_the_site_origin() {
+        assert_eq!(
+            url_origin("https://xhamster.desi/videos/some-slug-xhABC123"),
+            "https://xhamster.desi"
+        );
+        assert_eq!(
+            absolute_preview_url(
+                "/thumb/a.jpg",
+                &url_origin("https://xhamster.desi/videos/x")
+            )
+            .as_deref(),
+            Some("https://xhamster.desi/thumb/a.jpg")
+        );
     }
 
     #[test]

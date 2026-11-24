@@ -43,7 +43,8 @@ Rust. The interface is built with `ratatui`, previews use `ratatui-image`, and
 - **Update check** — optional crates.io check shown in the header
 - **Live theming** — follows `pywal`, `wallust` or `matugen` palettes and
   repaints when the wallpaper changes
-- **Bounded caches** — preview images are stored under the user cache directory
+- **Lean runtime** — one shared HTTP client, small 320x180 decoded previews,
+  a byte-bounded cache and repaints only when something changes
 
 ## Requirements
 

@@ -1,28 +1,35 @@
 //! Preview images: terminal graphics detection, download, cache and decode.
 //!
 //! Every preview is normalized to one fixed pixel size so the sidebar draws
-//! artwork at a consistent shape no matter what the site serves. The actual
-//! protocol (kitty, sixel, iTerm2, or unicode half-blocks) is chosen by
-//! `ratatui-image` from what the terminal reports.
+//! artwork at a consistent shape no matter what the site serves. The size is
+//! deliberately small: the TUI renders into a sidebar, so decoding a 1080p
+//! still only wastes memory and bandwidth. The protocol (kitty, sixel, iTerm2,
+//! or unicode half-blocks) is chosen by `ratatui-image` from the terminal.
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
-use std::time::Duration;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use image::DynamicImage;
 use ratatui_image::picker::Picker;
 
-/// Preview images are scaled to this box before rendering.
-pub const PREVIEW_WIDTH: u32 = 480;
-pub const PREVIEW_HEIGHT: u32 = 270;
+/// Preview images are scaled to this box before rendering. 320x180 is ample
+/// for a sidebar and keeps the decoded RGBA buffer around 220 KiB per image.
+pub const PREVIEW_WIDTH: u32 = 320;
+pub const PREVIEW_HEIGHT: u32 = 180;
 
-/// Keep the cache bounded; the oldest files are dropped first.
-const MAX_CACHE_FILES: usize = 200;
+/// Keep the disk cache bounded by both entry count and total size. A corrupt
+/// or stale cache file is replaced on the next load instead of failing forever.
+const MAX_CACHE_FILES: usize = 160;
+const MAX_CACHE_BYTES: u64 = 24 * 1024 * 1024;
+/// A preview larger than this is almost certainly a full-size still the site
+/// served by mistake; refusing it keeps a single selection from spiking RSS.
+const MAX_DOWNLOAD_BYTES: u64 = 8 * 1024 * 1024;
+const DOWNLOAD_ATTEMPTS: usize = 2;
 
-const USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 \
-                          (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36";
+const PORNHUB_REFERRER: &str = "https://www.pornhub.com/";
+const XHAMSTER_REFERRER: &str = "https://xhamster.desi/";
 
 /// Ask the terminal which image protocol and font size it supports, falling
 /// back to unicode half-blocks on anything that does not answer.
@@ -65,23 +72,34 @@ pub fn cache_path(viewkey: &str) -> PathBuf {
 /// Blocking on purpose: callers run this on a worker thread while the UI
 /// keeps rendering and polling for the result.
 pub fn load(url: &str, cache_path: &Path) -> Result<DynamicImage> {
-    let bytes = match fs::read(cache_path) {
-        Ok(bytes) if !bytes.is_empty() => bytes,
-        _ => {
-            let bytes = download(url)?;
-            if let Some(parent) = cache_path.parent() {
-                let _ = fs::create_dir_all(parent);
-            }
-            let _ = fs::write(cache_path, &bytes);
-            if let Some(parent) = cache_path.parent() {
-                prune(parent, MAX_CACHE_FILES);
-            }
-            bytes
+    if let Some(bytes) = cached_bytes(cache_path) {
+        if let Some(image) = decode_preview(&bytes) {
+            return Ok(normalize(image));
         }
-    };
+        // A truncated download must not poison the cache permanently.
+        let _ = fs::remove_file(cache_path);
+    }
 
-    let image = image::load_from_memory(&bytes).context("could not decode preview image")?;
+    let bytes = download(url)?;
+    if bytes.is_empty() {
+        bail!("preview response was empty for {url}");
+    }
+    write_cache(cache_path, &bytes);
+    if let Some(parent) = cache_path.parent() {
+        prune(parent, MAX_CACHE_FILES, MAX_CACHE_BYTES);
+    }
+
+    let image = decode_preview(&bytes).context("could not decode preview image")?;
     Ok(normalize(image))
+}
+
+fn cached_bytes(path: &Path) -> Option<Vec<u8>> {
+    let bytes = fs::read(path).ok()?;
+    (!bytes.is_empty()).then_some(bytes)
+}
+
+fn decode_preview(bytes: &[u8]) -> Option<DynamicImage> {
+    image::load_from_memory(bytes).ok()
 }
 
 /// Center-crop to 16:9 and scale to the fixed preview size.
@@ -110,52 +128,116 @@ fn normalize(image: DynamicImage) -> DynamicImage {
     )
 }
 
-fn client() -> Result<&'static reqwest::blocking::Client> {
-    static CLIENT: OnceLock<reqwest::blocking::Client> = OnceLock::new();
-    if let Some(client) = CLIENT.get() {
-        return Ok(client);
+/// Write through a temporary file so an interrupted run can never leave a
+/// half-written image that later looks like a valid cache hit.
+fn write_cache(path: &Path, bytes: &[u8]) {
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    if fs::create_dir_all(parent).is_err() {
+        return;
     }
-    let built = reqwest::blocking::Client::builder()
-        .user_agent(USER_AGENT)
-        .timeout(Duration::from_secs(15))
-        .build()
-        .context("could not build the image HTTP client")?;
-    Ok(CLIENT.get_or_init(|| built))
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or(0);
+    let tmp = path.with_extension(format!("{}.{nonce}.tmp", std::process::id()));
+    if fs::write(&tmp, bytes).is_ok() {
+        let _ = fs::rename(&tmp, path);
+    }
+    let _ = fs::remove_file(&tmp);
 }
 
+/// CDNs often reject image requests without a page referer. Retrying with a
+/// no-cache header also recovers signed URLs that were briefly unavailable.
 fn download(url: &str) -> Result<Vec<u8>> {
-    let response = client()?
+    let mut last = anyhow!("preview request failed for {url}");
+    for attempt in 0..DOWNLOAD_ATTEMPTS {
+        match fetch_once(url, attempt > 0) {
+            Ok(bytes) if !bytes.is_empty() => return Ok(bytes),
+            Ok(_) => last = anyhow!("preview response was empty for {url}"),
+            Err(error) => last = error,
+        }
+    }
+    Err(last)
+}
+
+fn fetch_once(url: &str, retry: bool) -> Result<Vec<u8>> {
+    let mut request = crate::http::client()?
         .get(url)
-        .header("Accept", "image/*")
+        .header(
+            "Accept",
+            "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+        )
+        .header("Accept-Language", "en-US,en;q=0.9")
+        .header("Referer", referer_for(url));
+    if retry {
+        request = request
+            .header("Cache-Control", "no-cache")
+            .header("Pragma", "no-cache");
+    }
+
+    let response = request
         .send()
-        .with_context(|| format!("could not fetch preview {url}"))?
-        .error_for_status()
-        .with_context(|| format!("preview request failed for {url}"))?;
+        .with_context(|| format!("could not fetch preview {url}"))?;
+    let status = response.status();
+    if !status.is_success() {
+        bail!("preview request failed for {url} with HTTP {status}");
+    }
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_DOWNLOAD_BYTES)
+    {
+        bail!("preview is unexpectedly large for {url}");
+    }
     let bytes = response.bytes().context("could not read preview body")?;
+    if bytes.len() as u64 > MAX_DOWNLOAD_BYTES {
+        bail!("preview body is unexpectedly large for {url}");
+    }
     Ok(bytes.to_vec())
 }
 
-/// Drop the oldest files so the cache stays under `max` entries.
-fn prune(directory: &Path, max: usize) {
+fn referer_for(url: &str) -> &'static str {
+    if url.contains("xhamster") || url.contains("xhcdn") {
+        XHAMSTER_REFERRER
+    } else {
+        PORNHUB_REFERRER
+    }
+}
+
+/// Drop the oldest files until both the entry count and byte budget are met.
+fn prune(directory: &Path, max_files: usize, max_bytes: u64) {
     let Ok(entries) = fs::read_dir(directory) else {
         return;
     };
-    let mut files: Vec<(std::time::SystemTime, PathBuf)> = entries
+    let mut files: Vec<(SystemTime, PathBuf, u64)> = entries
         .flatten()
         .filter_map(|entry| {
             let path = entry.path();
+            if path.extension().is_some_and(|extension| extension != "img") {
+                return None;
+            }
             let meta = entry.metadata().ok()?;
             meta.is_file()
-                .then(|| (meta.modified().unwrap_or(std::time::UNIX_EPOCH), path))
+                .then(|| (meta.modified().unwrap_or(UNIX_EPOCH), path, meta.len()))
         })
         .collect();
 
-    if files.len() <= max {
+    let mut count = files.len();
+    let mut bytes: u64 = files.iter().map(|(_, _, size)| *size).sum();
+    if count <= max_files && bytes <= max_bytes {
         return;
     }
-    files.sort_by_key(|(modified, _)| *modified);
-    for (_, path) in files.iter().take(files.len() - max) {
-        let _ = fs::remove_file(path);
+
+    files.sort_by_key(|(modified, _, _)| *modified);
+    for (_, path, size) in files {
+        if count <= max_files && bytes <= max_bytes {
+            break;
+        }
+        if fs::remove_file(&path).is_ok() {
+            count -= 1;
+            bytes = bytes.saturating_sub(size);
+        }
     }
 }
 
@@ -175,7 +257,7 @@ mod tests {
     #[test]
     fn every_source_lands_on_the_same_size() {
         for (width, height) in [
-            (480u32, 270u32),
+            (320u32, 180u32),
             (640, 360),
             (720, 404),
             (640, 480),
@@ -199,5 +281,51 @@ mod tests {
         let path = cache_path("../../etc/passwd");
         assert_eq!(path.extension().unwrap(), "img");
         assert!(!path.to_string_lossy().contains(".."));
+    }
+
+    #[test]
+    fn corrupt_cached_bytes_are_rejected() {
+        assert!(decode_preview(b"not an image").is_none());
+        assert!(decode_preview(&[]).is_none());
+    }
+
+    #[test]
+    fn download_referer_follows_the_source_site() {
+        assert_eq!(referer_for("https://cdn.example/a.jpg"), PORNHUB_REFERRER);
+        assert_eq!(
+            referer_for("https://ic-vt-nss.xhcdn.com/a/b.webp"),
+            XHAMSTER_REFERRER
+        );
+        assert_eq!(
+            referer_for("https://xhamster.desi/thumb.jpg"),
+            XHAMSTER_REFERRER
+        );
+    }
+
+    #[test]
+    fn prune_bounds_total_bytes() {
+        let directory = std::env::temp_dir().join(format!("ph-tui-prune-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory).unwrap();
+        for index in 0..3 {
+            fs::write(directory.join(format!("{index}.img")), vec![0u8; 10]).unwrap();
+        }
+        fs::write(directory.join("keep.tmp"), vec![0u8; 10]).unwrap();
+
+        prune(&directory, 10, 15);
+
+        let files: Vec<_> = fs::read_dir(&directory)
+            .unwrap()
+            .flatten()
+            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "img"))
+            .collect();
+        let total: u64 = files
+            .iter()
+            .filter_map(|entry| entry.metadata().ok().map(|meta| meta.len()))
+            .sum();
+        assert!(files.len() <= 2, "left {} cache files", files.len());
+        assert!(total <= 15, "left {total} cached bytes");
+        assert!(directory.join("keep.tmp").exists());
+        fs::remove_dir_all(&directory).unwrap();
     }
 }

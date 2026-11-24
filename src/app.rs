@@ -5,7 +5,7 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
-use anyhow::{bail, Result};
+use anyhow::Result;
 use image::DynamicImage;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
@@ -181,13 +181,14 @@ impl Thumb {
 
     /// Point the preview at the current selection. Jumping through a list
     /// quickly only fetches the preview for wherever the cursor settles.
-    fn sync(&mut self, item: Option<&Item>) {
+    /// Returns true when the visible preview state changed.
+    fn sync(&mut self, item: Option<&Item>) -> bool {
         let target = match item {
             Some(item) if item.kind == Kind::Video => Some(item_watch_url(item)),
             _ => None,
         };
         if self.target == target {
-            return;
+            return false;
         }
 
         let preview = item.and_then(|item| item.image.clone());
@@ -202,9 +203,12 @@ impl Thumb {
             .target
             .clone()
             .map(|key| (key, preview, Instant::now()));
+        true
     }
 
-    fn poll(&mut self, picker: &Picker) {
+    /// Returns true only when a finished (or failed) preview needs a repaint.
+    fn poll(&mut self, picker: &Picker) -> bool {
+        let mut changed = false;
         if self.rx.is_none() {
             if let Some((key, preview, at)) = &self.pending {
                 if at.elapsed() >= THUMB_DEBOUNCE {
@@ -236,17 +240,20 @@ impl Thumb {
             Some((key, Ok(Ok(image)))) => {
                 if self.target.as_deref() == Some(key.as_str()) {
                     self.state = ThumbState::Ready(Box::new(picker.new_resize_protocol(image)));
+                    changed = true;
                 }
                 self.rx = None;
             }
             Some((key, Ok(Err(_)))) | Some((key, Err(TryRecvError::Disconnected))) => {
                 if self.target.as_deref() == Some(key.as_str()) {
                     self.state = ThumbState::Failed;
+                    changed = true;
                 }
                 self.rx = None;
             }
             Some((_, Err(TryRecvError::Empty))) | None => {}
         }
+        changed
     }
 }
 
@@ -343,7 +350,21 @@ impl App {
             .filter(|toast| toast.at.elapsed() < TOAST_TTL)
     }
 
-    fn poll_update(&mut self) {
+    /// Clear a toast once it expires so an idle screen can repaint exactly
+    /// once and then stop drawing until something else changes.
+    fn expire_toast(&mut self) -> bool {
+        let expired = self
+            .toast
+            .as_ref()
+            .is_some_and(|toast| toast.at.elapsed() >= TOAST_TTL);
+        if expired {
+            self.toast = None;
+        }
+        expired
+    }
+
+    /// Returns true when a background update check delivered a result.
+    fn poll_update(&mut self) -> bool {
         let received = self.update_rx.as_ref().map(Receiver::try_recv);
         match received {
             Some(Ok(Some(version))) => {
@@ -353,15 +374,18 @@ impl App {
                     UpdateState::Current(version)
                 };
                 self.update_rx = None;
+                true
             }
             Some(Ok(None)) => {
                 self.update = UpdateState::NoRelease;
                 self.update_rx = None;
+                true
             }
-            Some(Err(TryRecvError::Empty)) | None => {}
+            Some(Err(TryRecvError::Empty)) | None => false,
             Some(Err(TryRecvError::Disconnected)) => {
                 self.update = UpdateState::NoRelease;
                 self.update_rx = None;
+                true
             }
         }
     }
@@ -494,17 +518,23 @@ impl App {
 
             let mut list = List::new(items);
             let mut next: Option<(FeedKind, u32)> = None;
+            let mut dirty = true;
 
             loop {
-                self.poll_update();
-                self.poll_theme();
-                self.thumb.sync(list.selected());
-                self.thumb.poll(&self.picker);
-                term.draw(|frame| self.render_feed_page(frame, active, page, &mut list))?;
+                let changed = self.poll_update()
+                    | self.poll_theme()
+                    | self.thumb.sync(list.selected())
+                    | self.thumb.poll(&self.picker)
+                    | self.expire_toast();
+                if dirty || changed {
+                    term.draw(|frame| self.render_feed_page(frame, active, page, &mut list))?;
+                    dirty = false;
+                }
 
                 let Some(key) = tui::poll_key(POLL)? else {
                     continue;
                 };
+                dirty = true;
                 match key {
                     Key::Char('r') => next = Some((FeedKind::Recommendations, 1)),
                     Key::Char('h') => next = Some((FeedKind::Hottest, 1)),
@@ -889,18 +919,24 @@ impl App {
         filterable: bool,
         extra: &[(&str, &str)],
     ) -> Result<UiEvent> {
+        let mut dirty = true;
         loop {
-            self.poll_update();
-            self.poll_theme();
-            self.thumb.sync(list.selected());
-            self.thumb.poll(&self.picker);
-            term.draw(|frame| {
-                self.render_list_page(frame, crumb, panel_title, list, filterable, extra);
-            })?;
+            let changed = self.poll_update()
+                | self.poll_theme()
+                | self.thumb.sync(list.selected())
+                | self.thumb.poll(&self.picker)
+                | self.expire_toast();
+            if dirty || changed {
+                term.draw(|frame| {
+                    self.render_list_page(frame, crumb, panel_title, list, filterable, extra);
+                })?;
+                dirty = false;
+            }
 
             let Some(key) = tui::poll_key(POLL)? else {
                 continue;
             };
+            dirty = true;
             match key {
                 Key::Esc => return Ok(UiEvent::Back),
                 Key::Ctrl('c') => self.quit(),
@@ -947,16 +983,20 @@ impl App {
     ) -> Result<Option<String>> {
         let mut chars: Vec<char> = initial.chars().collect();
         let mut cursor = chars.len();
+        let mut dirty = true;
         self.thumb.reset();
 
         loop {
-            self.poll_update();
-            self.poll_theme();
-            term.draw(|frame| self.render_input(frame, title, hint, &chars, cursor))?;
+            let changed = self.poll_update() | self.poll_theme() | self.expire_toast();
+            if dirty || changed {
+                term.draw(|frame| self.render_input(frame, title, hint, &chars, cursor))?;
+                dirty = false;
+            }
 
             let Some(key) = tui::poll_key(POLL)? else {
                 continue;
             };
+            dirty = true;
             match key {
                 Key::Enter => {
                     let value: String = chars.iter().collect();
@@ -1023,8 +1063,15 @@ impl App {
             self.poll_update();
             self.poll_theme();
             match receiver.try_recv() {
-                Ok(result) => return result.map(Some),
-                Err(TryRecvError::Disconnected) => bail!("background request failed"),
+                Ok(Ok(value)) => return Ok(Some(value)),
+                Ok(Err(error)) => {
+                    self.set_toast(format!("Request failed: {error}"), Tone::Error);
+                    return Ok(None);
+                }
+                Err(TryRecvError::Disconnected) => {
+                    self.set_toast("Background request failed", Tone::Error);
+                    return Ok(None);
+                }
                 Err(TryRecvError::Empty) => {}
             }
 
