@@ -32,8 +32,9 @@ Rust. The interface is built with `ratatui`, previews use `ratatui-image`, and
 - **Home feeds** — a feed bar with Recommendations, Hottest, Most Viewed, Newest
   and Top Rated; each feed loads real videos with inline previews
 - **Categories and search** — fetch from the active site directly, page through results
-- **Site toggle** — press `x` on home to switch the feed bar between PornHub and
-  xHamster; press it again to go back to PornHub
+- **Site switching** — press `x` on home to toggle the feed bar between PornHub
+  and xHamster; press `e` to switch to Eporner, and `e` again to return to
+  PornHub
 - **Channel browsing** — press `c` on a video to open its uploader/channel in the TUI
 - **Playback** — hand the watch page to `mpv`, which resolves the stream through
   `yt-dlp`; playback is always capped at 320p. The terminal stays hidden while
@@ -129,7 +130,7 @@ Run `ph-tui` in a terminal. The home screen opens straight into the
    Another recommendation                   #def456  VIDEO
    ...                                               A recommended video
 ────────────────────────────────────────────────────────────────────────────────
- · N videos · N shown · page 1    ↑↓ move · enter watch · tab feed · c channel · / search · x xhamster · b browse · q quit
+ · N videos · N shown · page 1    ↑↓ move · enter watch · tab feed · c channel · / search · x xhamster · e eporner · q quit
 ```
 
 | Key | Action |
@@ -143,12 +144,14 @@ Run `ph-tui` in a terminal. The home screen opens straight into the
 | `b` / `1` | Browse the active site's categories |
 | `/` | Search the active site |
 | `x` | Toggle between PornHub and xHamster home feeds |
+| `e` | Switch to Eporner; press it again to return to PornHub |
 | `q` | Quit |
 
-`x` reloads the Recommendations feed for the new site; the feed bar, categories,
-search and channel links all follow it. Press `x` again to return to PornHub.
-The front page does not paginate; the four ordered feeds do. `2` / `u` still
-check for updates from the home screen, but the update check is not in the bar.
+`x` and `e` reload the Recommendations feed for the new site; the feed bar,
+categories, search and channel links all follow it. `x` toggles PornHub and
+xHamster, while `e` swaps Eporner in and out. The front page does not paginate;
+the four ordered feeds do. `2` / `u` still check for updates from the home
+screen, but the update check is not in the bar.
 
 ### Lists
 
@@ -208,8 +211,8 @@ cargo test                  # parser, list, preview, theme and render tests
 cargo test -- --ignored     # live requests against the real site
 ```
 
-The ignored tests perform real HTTP requests for all five home feeds,
-categories, a category page, a search page and a preview image.
+The ignored tests perform real HTTP requests for all five home feeds on each
+site, categories, category pages, search results and a preview image.
 
 ## Notes and limitations
 
@@ -217,8 +220,8 @@ categories, a category page, a search page and a preview image.
   Failed requests return to the previous screen with a status message instead
   of crashing the interface.
 - Streaming depends on `mpv`, `yt-dlp` and `curl_cffi` supporting the site;
-  keep `yt-dlp` up to date. mpv errors are shown in the terminal so stream
-  failures are visible.
+  keep `yt-dlp` up to date. Playback failures come back as an in-app status
+  message; mpv output stays hidden while the window is open.
 - Playback always requests 320p via
   `--ytdl-format=bestvideo[height<=320]+bestaudio/best[height<=320]`.
   The quality prompt on `Ctrl-D` only affects downloads.

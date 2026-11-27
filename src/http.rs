@@ -1,1 +1,1831 @@
-RESTORE_FROM_ARTIFACT
+use std::collections::{HashMap, HashSet};
+use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
+
+use anyhow::{anyhow, bail, Context, Result};
+use scraper::{ElementRef, Html, Selector};
+use serde::Deserialize;
+use serde_json::Value;
+
+use crate::model::{watch_url, Category, FeedKind, Video};
+
+const BASE: &str = "https://www.pornhub.com";
+const USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 \
+                          (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36";
+
+/// One client for the whole process. Reusing it keeps connections alive and
+/// avoids rebuilding TLS state for every feed, page and preview request.
+pub(crate) fn client() -> Result<&'static reqwest::blocking::Client> {
+    static CLIENT: OnceLock<std::result::Result<reqwest::blocking::Client, String>> =
+        OnceLock::new();
+    let built = CLIENT.get_or_init(|| {
+        reqwest::blocking::Client::builder()
+            .user_agent(USER_AGENT)
+            .timeout(Duration::from_secs(15))
+            // A handful of idle connections is plenty for one preview at a
+            // time; leaving the pool unbounded is pure resident memory.
+            .pool_max_idle_per_host(2)
+            .build()
+            .map_err(|error| error.to_string())
+    });
+    built
+        .as_ref()
+        .map_err(|error| anyhow!("failed to build HTTP client: {error}"))
+}
+
+/// A single timed-out read should not tear down the TUI or leave an empty
+/// screen. Retry the same URL a couple of times before giving up.
+const HTML_ATTEMPTS: usize = 3;
+
+fn get_html(url: &str) -> Result<String> {
+    let mut last = anyhow!("no request was made for {url}");
+    for attempt in 0..HTML_ATTEMPTS {
+        match get_html_once(url, attempt > 0) {
+            Ok(html) => return Ok(html),
+            Err(error) => last = error,
+        }
+    }
+    Err(last)
+}
+
+fn get_html_once(url: &str, retry: bool) -> Result<String> {
+    let mut request = client()?.get(url);
+    if retry {
+        request = request
+            .header("Cache-Control", "no-cache")
+            .header("Pragma", "no-cache");
+    }
+    let response = request.send().with_context(|| format!("GET {url}"))?;
+    read_html(response, url)
+}
+
+/// Same retry policy for requests that need query parameters.
+fn get_html_query(url: &str, params: &[(&str, String)]) -> Result<String> {
+    let mut last = anyhow!("no request was made for {url}");
+    for attempt in 0..HTML_ATTEMPTS {
+        let mut request = match client() {
+            Ok(client) => client.get(url).query(params),
+            Err(error) => return Err(error),
+        };
+        if attempt > 0 {
+            request = request
+                .header("Cache-Control", "no-cache")
+                .header("Pragma", "no-cache");
+        }
+        match request
+            .send()
+            .with_context(|| format!("GET {url}"))
+            .and_then(|response| read_html(response, url))
+        {
+            Ok(html) => return Ok(html),
+            Err(error) => last = error,
+        }
+    }
+    Err(last)
+}
+
+fn read_html(response: reqwest::blocking::Response, url: &str) -> Result<String> {
+    let status = response.status();
+    if !status.is_success() {
+        bail!("unexpected HTTP status {status} for {url}");
+    }
+    response.text().context("failed to read response body")
+}
+
+/// POST a form, following redirects, and return the final URL together with
+/// the body. A 404 is reported as `None` because search engines commonly use it
+/// for "no results"; that should leave an empty list, not a toast.
+fn post_html_form(url: &str, params: &[(&str, String)]) -> Result<Option<(String, String)>> {
+    let mut last = anyhow!("no request was made for {url}");
+    for attempt in 0..HTML_ATTEMPTS {
+        let mut request = match client() {
+            Ok(client) => client.post(url).header("Referer", url).form(params),
+            Err(error) => return Err(error),
+        };
+        if attempt > 0 {
+            request = request
+                .header("Cache-Control", "no-cache")
+                .header("Pragma", "no-cache");
+        }
+        match request.send().with_context(|| format!("POST {url}")) {
+            Ok(response) => {
+                if response.status() == reqwest::StatusCode::NOT_FOUND {
+                    return Ok(None);
+                }
+                let final_url = response.url().to_string();
+                match read_html(response, url) {
+                    Ok(html) => return Ok(Some((final_url, html))),
+                    Err(error) => last = error,
+                }
+            }
+            Err(error) => last = error,
+        }
+    }
+    Err(last)
+}
+
+#[derive(Debug, Deserialize)]
+struct CategoryResponse {
+    categories: Vec<RawCategory>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawCategory {
+    #[serde(default)]
+    id: Value,
+    #[serde(default)]
+    category: String,
+}
+
+/// Fetch every category from the webmasters API, prettified and sorted.
+pub fn categories() -> Result<Vec<Category>> {
+    let body = get_html(&format!("{BASE}/webmasters/categories"))?;
+    let parsed: CategoryResponse =
+        serde_json::from_str(&body).context("unexpected categories API response")?;
+
+    let mut categories: Vec<Category> = parsed
+        .categories
+        .into_iter()
+        .filter_map(|raw| {
+            let id = match raw.id {
+                Value::String(s) if !s.is_empty() => s,
+                Value::Number(n) => n.to_string(),
+                _ => return None,
+            };
+            if raw.category.is_empty() {
+                return None;
+            }
+            Some(Category {
+                id,
+                name: prettify_category(&raw.category),
+            })
+        })
+        .collect();
+
+    categories.sort_by_key(|c| c.name.to_lowercase());
+    Ok(categories)
+}
+
+/// `"big-tits"` -> `"Big Tits"`.
+pub fn prettify_category(raw: &str) -> String {
+    raw.replace('-', " ")
+        .split(' ')
+        .map(capitalize_first)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn capitalize_first(word: &str) -> String {
+    let mut chars = word.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    }
+}
+
+/// Videos in a home feed.
+///
+/// `Recommendations` is the personalized front page (it does not paginate);
+/// the rest are the site's own ordering pages, which do. All of them use the
+/// same listing parser as search and categories, so previews come for free.
+pub fn feed_videos(feed: FeedKind, page: u32) -> Result<Vec<Video>> {
+    let url = match feed {
+        FeedKind::Recommendations => format!("{BASE}/"),
+        FeedKind::Hottest => format!("{BASE}/video?o=ht&page={page}"),
+        FeedKind::MostViewed => format!("{BASE}/video?o=mv&page={page}"),
+        FeedKind::Newest => format!("{BASE}/video?o=cm&page={page}"),
+        FeedKind::TopRated => format!("{BASE}/video?o=tr&page={page}"),
+    };
+    let html = get_html(&url)?;
+    Ok(videos_from_html(&html))
+}
+
+/// xHamster equivalents of the home feed bar. The site calls its front page
+/// "Trending" and exposes ordered pages through `/newest` and `/best`; weekly
+/// and monthly best lists stand in for the two ranking feeds PornHub provides.
+pub fn xhamster_feed_videos(feed: FeedKind, page: u32) -> Result<Vec<Video>> {
+    let html = get_html(&xhamster_feed_url(feed, page))?;
+    Ok(xhamster_videos_from_html(&html))
+}
+
+fn xhamster_feed_url(feed: FeedKind, page: u32) -> String {
+    let base = match feed {
+        FeedKind::Recommendations => BASE_XHAMSTER.to_string(),
+        FeedKind::Hottest => format!("{BASE_XHAMSTER}/best/weekly"),
+        FeedKind::MostViewed => format!("{BASE_XHAMSTER}/best"),
+        FeedKind::Newest => format!("{BASE_XHAMSTER}/newest"),
+        FeedKind::TopRated => format!("{BASE_XHAMSTER}/best/monthly"),
+    };
+    if feed.paginated() && page > 1 {
+        format!("{base}/{page}")
+    } else {
+        base
+    }
+}
+
+/// Videos listed for a category.
+pub fn category_videos(category_id: &str, page: u32) -> Result<Vec<Video>> {
+    let url = format!("{BASE}/video?c={category_id}&page={page}");
+    let html = get_html(&url)?;
+    Ok(videos_from_html(&html))
+}
+
+/// Categories from xHamster's own index, prettified and sorted like PornHub's.
+pub fn xhamster_categories() -> Result<Vec<Category>> {
+    let html = get_html(&format!("{BASE_XHAMSTER}/categories"))?;
+    let document = Html::parse_document(&html);
+    let selector = Selector::parse("a[href]").expect("static selector is valid");
+    let mut seen = HashSet::new();
+    let mut categories = Vec::new();
+
+    for anchor in document.select(&selector) {
+        let Some(href) = anchor.value().attr("href") else {
+            continue;
+        };
+        let Some(raw_path) = href_path(href) else {
+            continue;
+        };
+        let path = clean_path(&raw_path);
+        let Some(slug) = path.strip_prefix("/categories/") else {
+            continue;
+        };
+        let id = slug.split('/').next().unwrap_or("");
+        if id.is_empty() || !seen.insert(id.to_string()) {
+            continue;
+        }
+        let name = anchor_name(&anchor);
+        if !name.is_empty() {
+            categories.push(Category {
+                id: id.to_string(),
+                name,
+            });
+        }
+    }
+
+    categories.sort_by_key(|category| category.name.to_lowercase());
+    Ok(categories)
+}
+
+/// Videos listed for an xHamster category. Ordered pages use a `/N` suffix.
+pub fn xhamster_category_videos(category_id: &str, page: u32) -> Result<Vec<Video>> {
+    let base = format!("{BASE_XHAMSTER}/categories/{category_id}");
+    let url = if page > 1 {
+        format!("{base}/{page}")
+    } else {
+        base
+    };
+    let html = get_html(&url)?;
+    Ok(xhamster_videos_from_html(&html))
+}
+
+/// Search results (PornHub). The site already ranks matches, so its order
+/// is kept as-is. No local title-keyword filtering.
+pub fn search_videos(query: &str, page: u32) -> Result<Vec<Video>> {
+    let url = format!("{BASE}/video/search");
+    let params = [("search", query.to_string()), ("page", page.to_string())];
+    let html = get_html_query(&url, &params)?;
+    Ok(videos_from_html(&html))
+}
+
+/// xHamster search results.
+///
+/// The site already ranks matches, so its order is kept as-is. Query parameters
+/// are passed through reqwest so spaces and punctuation are encoded correctly.
+pub fn xhamster_search(query: &str, page: u32) -> Result<Vec<Video>> {
+    let url = format!("{BASE_XHAMSTER}/search");
+    let params = [("q", query.to_string()), ("page", page.to_string())];
+    let html = get_html_query(&url, &params)?;
+    Ok(xhamster_videos_from_html(&html))
+}
+
+/// Eporner home feeds. The front page is "Best HD Porn Videos"; the ordered
+/// pages are `/best-videos/`, `/most-viewed/`, `/recent/` and `/top-rated/`.
+pub fn eporner_feed_videos(feed: FeedKind, page: u32) -> Result<Vec<Video>> {
+    let html = get_html(&eporner_feed_url(feed, page))?;
+    Ok(eporner_videos_from_html(&html))
+}
+
+fn eporner_feed_url(feed: FeedKind, page: u32) -> String {
+    match feed {
+        FeedKind::Recommendations => format!("{BASE_EPORNER}/"),
+        FeedKind::Hottest if page <= 1 => format!("{BASE_EPORNER}/best-videos/"),
+        FeedKind::Hottest => format!("{BASE_EPORNER}/best-videos/{page}/"),
+        FeedKind::MostViewed if page <= 1 => format!("{BASE_EPORNER}/most-viewed/"),
+        FeedKind::MostViewed => format!("{BASE_EPORNER}/{page}/most-viewed/"),
+        FeedKind::Newest if page <= 1 => format!("{BASE_EPORNER}/recent/"),
+        FeedKind::Newest => format!("{BASE_EPORNER}/{page}/recent/"),
+        FeedKind::TopRated if page <= 1 => format!("{BASE_EPORNER}/top-rated/"),
+        FeedKind::TopRated => format!("{BASE_EPORNER}/top-rated/{page}/"),
+    }
+}
+
+/// Categories from Eporner's `/cat/all/` index. Anchors carry a full
+/// `title="Big Tits Porn"`; the " Porn" suffix is dropped for the UI.
+pub fn eporner_categories() -> Result<Vec<Category>> {
+    let html = get_html(&format!("{BASE_EPORNER}/cat/all/"))?;
+    let document = Html::parse_document(&html);
+    let selector = Selector::parse("a[href]").expect("static selector is valid");
+    let mut seen = HashSet::new();
+    let mut categories = Vec::new();
+
+    for anchor in document.select(&selector) {
+        let Some(href) = anchor.value().attr("href") else {
+            continue;
+        };
+        let Some(raw_path) = href_path(href) else {
+            continue;
+        };
+        let path = clean_path(&raw_path).trim_end_matches('/');
+        let Some(slug) = path.strip_prefix("/cat/") else {
+            continue;
+        };
+        if slug.is_empty() || slug == "all" || slug.contains('/') || !seen.insert(slug.to_string())
+        {
+            continue;
+        }
+        let Some(name) = eporner_category_name(&anchor) else {
+            continue;
+        };
+        categories.push(Category {
+            id: slug.to_string(),
+            name,
+        });
+    }
+
+    categories.sort_by_key(|category| category.name.to_lowercase());
+    Ok(categories)
+}
+
+fn eporner_category_name(anchor: &ElementRef<'_>) -> Option<String> {
+    let raw = anchor
+        .value()
+        .attr("title")
+        .map(str::trim)
+        .filter(|title| !title.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| anchor_name(anchor));
+    let raw = decode_entities(raw.trim());
+    let cleaned = raw
+        .strip_suffix(" Porn")
+        .map(str::trim)
+        .unwrap_or(raw.as_str())
+        .trim();
+    (!cleaned.is_empty()).then(|| cleaned.to_string())
+}
+
+/// Videos listed for an Eporner category. Ordered pages use a `/N` suffix.
+pub fn eporner_category_videos(category_id: &str, page: u32) -> Result<Vec<Video>> {
+    let url = if page > 1 {
+        format!("{BASE_EPORNER}/cat/{category_id}/{page}/")
+    } else {
+        format!("{BASE_EPORNER}/cat/{category_id}/")
+    };
+    let html = get_html(&url)?;
+    Ok(eporner_videos_from_html(&html))
+}
+
+/// Eporner search. The site only accepts a POST and redirects multi-word
+/// queries to a tag page such as `/tag/big-tits/`. Pages after the first use
+/// that resolved tag URL, so they keep the same ranking.
+pub fn eporner_search(query: &str, page: u32) -> Result<Vec<Video>> {
+    if page > 1 {
+        let Some(tag) = eporner_search_tag(query)? else {
+            return Ok(Vec::new());
+        };
+        let html = get_html(&format!("{tag}{page}/"))?;
+        return Ok(eporner_videos_from_html(&html));
+    }
+
+    let Some((final_url, html)) = eporner_post_search(query)? else {
+        return Ok(Vec::new());
+    };
+    if let Some(tag) = eporner_search_tag_url(&final_url) {
+        cache_search_tag(query, tag);
+    }
+    Ok(eporner_videos_from_html(&html))
+}
+
+fn eporner_post_search(query: &str) -> Result<Option<(String, String)>> {
+    post_html_form(
+        &format!("{BASE_EPORNER}/search/"),
+        &[("search", query.to_string())],
+    )
+}
+
+fn eporner_search_tag(query: &str) -> Result<Option<String>> {
+    let key = query.trim().to_lowercase();
+    if let Some(tag) = eporner_search_cache()
+        .lock()
+        .ok()
+        .and_then(|cache| cache.get(&key).cloned())
+    {
+        return Ok(Some(tag));
+    }
+
+    let Some((final_url, _html)) = eporner_post_search(query)? else {
+        return Ok(None);
+    };
+    let Some(tag) = eporner_search_tag_url(&final_url) else {
+        return Ok(None);
+    };
+    cache_search_tag(query, tag.clone());
+    Ok(Some(tag))
+}
+
+/// `/tag/big-tits/` from the URL the POST redirects to. Other destinations
+/// mean the search had no usable results.
+fn eporner_search_tag_url(final_url: &str) -> Option<String> {
+    let raw_path = href_path(final_url)?;
+    let path = clean_path(&raw_path).trim_end_matches('/');
+    let slug = path.strip_prefix("/tag/")?;
+    if slug.is_empty() || slug.contains('/') {
+        return None;
+    }
+    Some(format!("{BASE_EPORNER}{path}/"))
+}
+
+const SEARCH_TAG_CACHE_LIMIT: usize = 64;
+
+fn cache_search_tag(query: &str, tag: String) {
+    if let Ok(mut cache) = eporner_search_cache().lock() {
+        if cache.len() >= SEARCH_TAG_CACHE_LIMIT {
+            cache.clear();
+        }
+        cache.insert(query.trim().to_lowercase(), tag);
+    }
+}
+
+fn eporner_search_cache() -> &'static Mutex<HashMap<String, String>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Extract videos from Eporner listing HTML.
+///
+/// Each card is `div.mb`: the thumbnail and title both link to
+/// `/video-<id>/<slug>/` (or `/hd-porn/<id>/<slug>/`), and the uploader is a
+/// `/profile/<name>/` anchor inside the stats row.
+fn eporner_videos_from_html(html: &str) -> Vec<Video> {
+    let document = Html::parse_document(html);
+    let cards = Selector::parse("div.mb").expect("static selector is valid");
+    let anchors = Selector::parse("a[href]").expect("static selector is valid");
+    let titles = Selector::parse("p.mbtit a").expect("static selector is valid");
+    let images = Selector::parse("img").expect("static selector is valid");
+    let mut positions: HashMap<String, usize> = HashMap::new();
+    let mut videos: Vec<Video> = Vec::new();
+
+    for card in document.select(&cards) {
+        let Some((watch_url, id)) = card
+            .select(&anchors)
+            .find_map(|anchor| anchor.value().attr("href").and_then(eporner_watch_url))
+        else {
+            continue;
+        };
+        let viewkey = format!("ep{id}");
+        let title = card
+            .select(&titles)
+            .next()
+            .map(|anchor| decode_entities(anchor.text().collect::<String>().trim()))
+            .filter(|title| !title.is_empty())
+            .or_else(|| {
+                card.select(&images)
+                    .next()
+                    .and_then(|image| image.value().attr("alt"))
+                    .map(|alt| decode_entities(alt.trim()))
+                    .filter(|title| !title.is_empty())
+            })
+            .or_else(|| {
+                card.select(&anchors).find_map(|anchor| {
+                    let text = decode_entities(anchor.text().collect::<String>().trim());
+                    (!text.is_empty()).then_some(text)
+                })
+            });
+        let Some(title) = title else {
+            continue;
+        };
+
+        let preview = preview_from_link(&card, &images, BASE_EPORNER);
+        let channel = eporner_channel_from_card(&card);
+
+        if let Some(&index) = positions.get(&viewkey) {
+            if videos[index].preview.is_none() {
+                videos[index].preview = preview;
+            }
+            if videos[index].channel_url.is_none() {
+                videos[index].channel = channel.as_ref().map(|(name, _)| name.clone());
+                videos[index].channel_url = channel.map(|(_, url)| url);
+            }
+            continue;
+        }
+
+        positions.insert(viewkey.clone(), videos.len());
+        videos.push(Video {
+            viewkey,
+            title,
+            preview,
+            watch_url: Some(watch_url),
+            channel: channel.as_ref().map(|(name, _)| name.clone()),
+            channel_url: channel.map(|(_, url)| url),
+        });
+    }
+
+    videos
+}
+
+/// Normalize `/video-<id>/...` and `/hd-porn/<id>/...` links to an absolute
+/// watch URL and return the stable id.
+fn eporner_watch_url(href: &str) -> Option<(String, String)> {
+    let raw_path = href_path(href)?;
+    let path = clean_path(&raw_path);
+    let rest = path
+        .strip_prefix("/video-")
+        .or_else(|| path.strip_prefix("/hd-porn/"))?;
+    let id = rest.split('/').next()?;
+    if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return None;
+    }
+    Some((format!("{BASE_EPORNER}{path}"), id.to_string()))
+}
+
+fn eporner_channel_from_card(card: &ElementRef<'_>) -> Option<(String, String)> {
+    let anchors = Selector::parse("a[href]").expect("static selector is valid");
+    for anchor in card.select(&anchors) {
+        let Some(href) = anchor.value().attr("href") else {
+            continue;
+        };
+        let Some(url) = eporner_channel_url(href) else {
+            continue;
+        };
+        let name = {
+            let text = decode_entities(anchor.text().collect::<String>().trim());
+            if text.is_empty() {
+                anchor_name(&anchor)
+            } else {
+                text
+            }
+        };
+        if !name.is_empty() {
+            return Some((name, url));
+        }
+    }
+    None
+}
+
+fn eporner_channel_url(href: &str) -> Option<String> {
+    let raw_path = href_path(href)?;
+    let path = clean_path(&raw_path).trim_end_matches('/');
+    let slug = path.strip_prefix("/profile/")?;
+    let slug = slug.split('/').next()?;
+    if slug.is_empty() {
+        return None;
+    }
+    Some(format!("{BASE_EPORNER}/profile/{slug}/uploaded-videos/"))
+}
+
+const BASE_XHAMSTER: &str = "https://xhamster.desi";
+const BASE_EPORNER: &str = "https://www.eporner.com";
+
+/// Videos from a channel/uploader page. PornHub pages paginate with `?page=N`;
+/// xHamster creator, channel, and user pages use a `/N` path suffix; Eporner
+/// profiles expose `/uploaded-videos/` and append `/N/`.
+pub fn channel_videos(url: &str, page: u32) -> Result<Vec<Video>> {
+    if url.starts_with(BASE_EPORNER) {
+        let base = url.trim_end_matches('/');
+        let page_url = if page > 1 {
+            format!("{base}/{page}/")
+        } else {
+            format!("{base}/")
+        };
+        let html = get_html(&page_url)?;
+        return Ok(eporner_videos_from_html(&html));
+    }
+
+    let html = if url.starts_with(BASE_XHAMSTER) {
+        let base = url.trim_end_matches('/');
+        let page_url = if page > 1 {
+            format!("{base}/{page}")
+        } else {
+            base.to_string()
+        };
+        get_html(&page_url)?
+    } else {
+        get_html(&format!("{url}?page={page}"))?
+    };
+
+    if url.starts_with(BASE_XHAMSTER) {
+        Ok(xhamster_videos_from_html(&html))
+    } else {
+        Ok(videos_from_html(&html))
+    }
+}
+
+/// Extract videos from xHamster listing HTML.
+///
+/// A video is rendered as two anchors that point at the same watch URL: the
+/// thumbnail carries `aria-label` and the image, while the title carries
+/// `title`. Dedupe by watch URL and keep whichever copy has the preview.
+fn xhamster_videos_from_html(html: &str) -> Vec<Video> {
+    let document = Html::parse_document(html);
+    let blocks =
+        Selector::parse("[data-role=\"thumb-list-block\"]").expect("static selector is valid");
+    let links =
+        Selector::parse("a[data-role=\"thumb-link\"][href]").expect("static selector is valid");
+    let images = Selector::parse("img").expect("static selector is valid");
+    let mut positions: HashMap<String, usize> = HashMap::new();
+    let mut videos: Vec<Video> = Vec::new();
+    let mut scoped = false;
+
+    for block in document.select(&blocks) {
+        scoped = true;
+        collect_xhamster_videos(block, &links, &images, &mut positions, &mut videos);
+    }
+    if !scoped {
+        collect_xhamster_videos(
+            document.root_element(),
+            &links,
+            &images,
+            &mut positions,
+            &mut videos,
+        );
+    }
+
+    videos
+}
+
+fn collect_xhamster_videos(
+    root: ElementRef<'_>,
+    links: &Selector,
+    images: &Selector,
+    positions: &mut HashMap<String, usize>,
+    videos: &mut Vec<Video>,
+) {
+    for link in root.select(links) {
+        let Some(href) = link.value().attr("href") else {
+            continue;
+        };
+        let Some(watch_url) = xhamster_watch_url(href) else {
+            continue;
+        };
+        let title = link
+            .value()
+            .attr("title")
+            .or_else(|| link.value().attr("aria-label"))
+            .map(|value| decode_entities(value.trim()))
+            .filter(|value| !value.is_empty())
+            .or_else(|| {
+                let text = decode_entities(link.text().collect::<String>().trim());
+                (!text.is_empty()).then_some(text)
+            });
+        let Some(title) = title else {
+            continue;
+        };
+        let preview = preview_from_link(&link, images, BASE_XHAMSTER);
+        let channel = channel_from_link(&link, Site::Xhamster);
+
+        if let Some(&index) = positions.get(&watch_url) {
+            if videos[index].preview.is_none() {
+                videos[index].preview = preview;
+            }
+            if videos[index].channel_url.is_none() {
+                videos[index].channel = channel.as_ref().map(|(name, _)| name.clone());
+                videos[index].channel_url = channel.map(|(_, url)| url);
+            }
+            continue;
+        }
+        let Some(viewkey) = xhamster_viewkey(&watch_url) else {
+            continue;
+        };
+        positions.insert(watch_url.clone(), videos.len());
+        videos.push(Video {
+            viewkey,
+            title,
+            preview,
+            watch_url: Some(watch_url),
+            channel: channel.as_ref().map(|(name, _)| name.clone()),
+            channel_url: channel.map(|(_, url)| url),
+        });
+    }
+}
+
+/// Normalize an xHamster `/videos/<slug>-xh<hash>` link to an absolute watch
+/// URL, dropping query strings and tracking fragments.
+fn xhamster_watch_url(href: &str) -> Option<String> {
+    let href = href.trim();
+    let absolute = if let Some(rest) = href
+        .strip_prefix("https://")
+        .or_else(|| href.strip_prefix("http://"))
+    {
+        format!("https://{rest}")
+    } else if href.starts_with('/') {
+        format!("{BASE_XHAMSTER}{href}")
+    } else {
+        return None;
+    };
+
+    let path_start = absolute.find("/videos/")?;
+    let path = &absolute[path_start..];
+    let end = path.find(['?', '#']).unwrap_or(path.len());
+    let path = &path[..end];
+    let slug = path.rsplit('/').next()?;
+    xhamster_viewkey_from_slug(slug)?;
+    Some(format!("{BASE_XHAMSTER}{path}"))
+}
+
+/// Use the stable hash from the slug as the display key, e.g. `xhVXyuL`.
+fn xhamster_viewkey(watch_url: &str) -> Option<String> {
+    let slug = watch_url.rsplit('/').next()?;
+    xhamster_viewkey_from_slug(slug)
+}
+
+fn xhamster_viewkey_from_slug(slug: &str) -> Option<String> {
+    let (_, hash) = slug.rsplit_once("-xh")?;
+    if hash.is_empty() || !hash.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return None;
+    }
+    Some(format!("xh{hash}"))
+}
+
+/// Decode the HTML entities that listing pages leave in `title` attributes.
+fn decode_entities(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find('&') {
+        out.push_str(&rest[..start]);
+        let after = &rest[start..];
+        let decoded = after
+            .find(';')
+            .and_then(|end| entity_char(&after[1..end]).map(|ch| (ch, end)));
+        match decoded {
+            Some((ch, end)) => {
+                out.push(ch);
+                rest = &after[end + 1..];
+            }
+            None => {
+                out.push('&');
+                rest = &after[1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Extract unique, titled video links from a results page.
+///
+/// Search, category and ordered-feed pages all wrap their real results in a
+/// known `<ul>`. Scoping to it keeps the header dropdowns (hottest, recommended,
+/// playlists) out of the list. The front page has no single container, so it
+/// falls back to a document-wide scan.
+pub fn videos_from_html(html: &str) -> Vec<Video> {
+    let document = Html::parse_document(html);
+    let images = Selector::parse("img").expect("static selector is valid");
+    let mut positions: HashMap<String, usize> = HashMap::new();
+    let mut videos: Vec<Video> = Vec::new();
+
+    for container in ["#videoSearchResult", "#videoCategory"] {
+        let selector = Selector::parse(container).expect("static selector is valid");
+        if let Some(root) = document.select(&selector).next() {
+            collect_videos(root, &images, &mut positions, &mut videos);
+            if !videos.is_empty() {
+                return videos;
+            }
+        }
+    }
+
+    collect_videos(
+        document.root_element(),
+        &images,
+        &mut positions,
+        &mut videos,
+    );
+    videos
+}
+
+fn collect_videos(
+    root: ElementRef<'_>,
+    images: &Selector,
+    positions: &mut HashMap<String, usize>,
+    videos: &mut Vec<Video>,
+) {
+    let selector = Selector::parse("a[href]").expect("static selector is valid");
+    for element in root.select(&selector) {
+        let Some(href) = element.value().attr("href") else {
+            continue;
+        };
+        let Some(viewkey) = viewkey_from_href(href) else {
+            continue;
+        };
+        let title = decode_entities(element.value().attr("title").unwrap_or("").trim());
+        let preview = preview_from_link(&element, images, BASE);
+        let channel = channel_from_link(&element, Site::Pornhub);
+
+        if let Some(&index) = positions.get(&viewkey) {
+            // The title anchor often follows the thumbnail anchor; keep the
+            // first title but fill in an image or channel discovered later.
+            if videos[index].preview.is_none() {
+                videos[index].preview = preview;
+            }
+            if videos[index].channel_url.is_none() {
+                videos[index].channel = channel.as_ref().map(|(name, _)| name.clone());
+                videos[index].channel_url = channel.map(|(_, url)| url);
+            }
+            continue;
+        }
+        if title.is_empty() {
+            continue;
+        }
+
+        positions.insert(viewkey.clone(), videos.len());
+        videos.push(Video {
+            viewkey,
+            title,
+            preview,
+            watch_url: None,
+            channel: channel.as_ref().map(|(name, _)| name.clone()),
+            channel_url: channel.map(|(_, url)| url),
+        });
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Site {
+    Pornhub,
+    Xhamster,
+}
+
+/// Find the uploader link inside the listing card that contains `link`.
+/// PornHub wraps each result in `li.videoblock`; xHamster uses a div with the
+/// `video-thumb` / `thumb-list__item` classes.
+fn channel_from_link(link: &ElementRef<'_>, site: Site) -> Option<(String, String)> {
+    let anchors = Selector::parse("a[href]").expect("static selector is valid");
+    let container = link
+        .ancestors()
+        .filter_map(ElementRef::wrap)
+        .take(10)
+        .find(|element| match site {
+            Site::Pornhub => {
+                element.value().name() == "li"
+                    && element
+                        .value()
+                        .classes()
+                        .any(|class| class == "videoblock" || class == "videoBox")
+            }
+            Site::Xhamster => {
+                element.value().name() == "div"
+                    && element
+                        .value()
+                        .classes()
+                        .any(|class| class == "video-thumb" || class == "thumb-list__item")
+            }
+        })?;
+
+    for anchor in container.select(&anchors) {
+        let Some(href) = anchor.value().attr("href") else {
+            continue;
+        };
+        let candidate = match site {
+            Site::Pornhub => pornhub_channel_url(href),
+            Site::Xhamster => xhamster_channel_url(href),
+        };
+        let Some(url) = candidate else {
+            continue;
+        };
+        let name = anchor_name(&anchor);
+        if !name.is_empty() {
+            return Some((name, url));
+        }
+    }
+    None
+}
+
+fn anchor_name(anchor: &ElementRef<'_>) -> String {
+    let title = anchor.value().attr("title").unwrap_or("").trim();
+    let raw = if title.is_empty() {
+        anchor.text().collect::<String>()
+    } else {
+        title.to_string()
+    };
+    decode_entities(raw.trim())
+}
+
+fn href_path(href: &str) -> Option<String> {
+    let href = href.trim();
+    if let Some(rest) = href
+        .strip_prefix("http://")
+        .or_else(|| href.strip_prefix("https://"))
+    {
+        let (_, path) = rest.split_once('/')?;
+        Some(format!("/{path}"))
+    } else if href.starts_with('/') {
+        Some(href.to_string())
+    } else {
+        None
+    }
+}
+
+fn clean_path(path: &str) -> &str {
+    let end = path.find(['?', '#']).unwrap_or(path.len());
+    &path[..end]
+}
+
+fn pornhub_channel_url(href: &str) -> Option<String> {
+    let raw_path = href_path(href)?;
+    let path = clean_path(&raw_path);
+    let prefix = ["/model/", "/channels/", "/user/", "/pornstar/"]
+        .into_iter()
+        .find(|prefix| path.starts_with(prefix))?;
+    let slug = path[prefix.len()..].split('/').next()?;
+    if slug.is_empty() {
+        return None;
+    }
+    Some(format!("https://www.pornhub.com{prefix}{slug}/videos"))
+}
+
+fn xhamster_channel_url(href: &str) -> Option<String> {
+    let raw_path = href_path(href)?;
+    let path = clean_path(&raw_path).trim_end_matches('/');
+    let segments: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
+    match segments.as_slice() {
+        [kind @ ("creators" | "channels"), slug] => Some(format!("{BASE_XHAMSTER}/{kind}/{slug}")),
+        ["users", slug] | ["users", slug, "videos"] => {
+            Some(format!("{BASE_XHAMSTER}/users/{slug}/videos"))
+        }
+        _ => None,
+    }
+}
+
+fn entity_char(entity: &str) -> Option<char> {
+    match entity {
+        "amp" => Some('&'),
+        "lt" => Some('<'),
+        "gt" => Some('>'),
+        "quot" => Some('"'),
+        "apos" => Some('\''),
+        "nbsp" => Some(' '),
+        _ => {
+            let code = entity.strip_prefix('#')?;
+            let value = if let Some(hex) = code.strip_prefix(['x', 'X']) {
+                u32::from_str_radix(hex, 16).ok()?
+            } else {
+                code.parse::<u32>().ok()?
+            };
+            char::from_u32(value)
+        }
+    }
+}
+
+/// Most listing anchors wrap their `<img>` and expose the still frame on one
+/// of several data attributes. The signed `data-image` URLs are still images
+/// even when the path contains `.mp4`.
+fn preview_from_link(link: &ElementRef, images: &Selector, base: &str) -> Option<String> {
+    for image in link.select(images) {
+        for attribute in [
+            "data-thumb_url",
+            "data-image",
+            "data-src",
+            "srcset",
+            "data-srcset",
+            "src",
+        ] {
+            let Some(raw) = image.value().attr(attribute) else {
+                continue;
+            };
+            let candidate = if attribute.ends_with("srcset") {
+                first_srcset_url(raw)
+            } else {
+                raw.trim()
+            };
+            if let Some(url) = absolute_preview_url(candidate, base) {
+                return Some(url);
+            }
+        }
+    }
+    None
+}
+
+/// Browsers list the smallest candidate first; picking it saves bandwidth and
+/// decode time because the TUI never needs a full-size still.
+fn first_srcset_url(srcset: &str) -> &str {
+    srcset
+        .split(',')
+        .next()
+        .and_then(|entry| entry.split_whitespace().next())
+        .unwrap_or("")
+        .trim()
+}
+
+/// Previews are occasionally served as protocol-relative or site-relative
+/// paths; leaving them unresolved was a common cause of a missing image.
+fn absolute_preview_url(raw: &str, base: &str) -> Option<String> {
+    let raw = raw.trim();
+    if raw.is_empty() || raw.starts_with("data:") {
+        return None;
+    }
+    if let Some(rest) = raw.strip_prefix("//") {
+        return Some(format!("https://{rest}"));
+    }
+    if raw.starts_with("http://") || raw.starts_with("https://") {
+        return Some(raw.to_string());
+    }
+    if raw.starts_with('/') {
+        return Some(format!("{}{raw}", base.trim_end_matches('/')));
+    }
+    Some(format!("{}/{raw}", base.trim_end_matches('/')))
+}
+
+/// `base` must be an origin, not a watch URL, or relative `og:image` paths get
+/// appended to the video slug and resolve to a 404.
+fn url_origin(url: &str) -> String {
+    let after_scheme = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .unwrap_or(url);
+    let host = after_scheme.split('/').next().unwrap_or(after_scheme);
+    let scheme = if url.starts_with("http://") {
+        "http"
+    } else {
+        "https"
+    };
+    format!("{scheme}://{host}")
+}
+
+fn viewkey_from_href(href: &str) -> Option<String> {
+    const MARKER: &str = "view_video.php?viewkey=";
+    let start = href.find(MARKER)? + MARKER.len();
+    let key: String = href[start..]
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric())
+        .collect();
+    (!key.is_empty()).then_some(key)
+}
+
+/// Resolve the preview image URL for a video by reading its watch page.
+///
+/// `identifier` is either a bare PornHub viewkey or a full watch URL (used by
+/// xHamster). Watch pages are big, so resolved URLs are memoized for the
+/// session. The caller runs this off the UI thread.
+pub fn preview_url(identifier: &str) -> Result<String> {
+    if let Some(url) = preview_cache()
+        .lock()
+        .ok()
+        .and_then(|cache| cache.get(identifier).cloned())
+    {
+        return Ok(url);
+    }
+    if no_preview_cache()
+        .lock()
+        .is_ok_and(|cache| cache.contains(identifier))
+    {
+        bail!("watch page for {identifier} has no preview image");
+    }
+
+    let page_url = if identifier.starts_with("http") {
+        identifier.to_string()
+    } else {
+        watch_url(identifier)
+    };
+    let origin = url_origin(&page_url);
+    let html = get_html(&page_url)?;
+    let Some(url) = og_image(&html).and_then(|raw| absolute_preview_url(&raw, &origin)) else {
+        if let Ok(mut cache) = no_preview_cache().lock() {
+            if cache.len() >= PREVIEW_CACHE_LIMIT {
+                cache.clear();
+            }
+            cache.insert(identifier.to_string());
+        }
+        bail!("watch page for {identifier} has no preview image");
+    };
+
+    if let Ok(mut cache) = preview_cache().lock() {
+        if cache.len() >= PREVIEW_CACHE_LIMIT {
+            cache.clear();
+        }
+        cache.insert(identifier.to_string(), url.clone());
+    }
+    Ok(url)
+}
+
+const PREVIEW_CACHE_LIMIT: usize = 64;
+
+fn preview_cache() -> &'static Mutex<HashMap<String, String>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Watch pages without a usable image are expensive to retry, so remember
+/// them for the session instead of re-downloading the same megabyte each time.
+fn no_preview_cache() -> &'static Mutex<HashSet<String>> {
+    static CACHE: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// Pull `og:image` out of a watch page.
+pub fn og_image(html: &str) -> Option<String> {
+    let document = Html::parse_document(html);
+    for pattern in [
+        "meta[property=\"og:image\"]",
+        "meta[name=\"og:image\"]",
+        "meta[property=\"og:image:url\"]",
+        "meta[name=\"twitter:image\"]",
+        "meta[property=\"twitter:image\"]",
+    ] {
+        let selector = Selector::parse(pattern).expect("static selector is valid");
+        for element in document.select(&selector) {
+            let Some(content) = element.value().attr("content") else {
+                continue;
+            };
+            let content = content.trim();
+            if !content.is_empty() {
+                return Some(content.to_string());
+            }
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prettifies_category_names() {
+        assert_eq!(prettify_category("big-tits"), "Big Tits");
+        assert_eq!(prettify_category("anal"), "Anal");
+        assert_eq!(prettify_category("ebony-and-black"), "Ebony And Black");
+        assert_eq!(prettify_category(""), "");
+    }
+
+    #[test]
+    fn extracts_and_dedupes_videos() {
+        let html = r#"
+            <html><body>
+              <a href="/view_video.php?viewkey=abc123" title="First video">
+                <img data-image="https://cdn.example/abc.jpg" src="data:image/png;base64,AAAA">
+              </a>
+              <a href="/view_video.php?viewkey=abc123" title="First video">dupe</a>
+              <a href="/view_video.php?viewkey=def456&pkey=1" title="  Second video  ">two</a>
+              <a href="/view_video.php?viewkey=ghi789" title="">untitled</a>
+              <a href="/model/whatever">not a video</a>
+            </body></html>
+        "#;
+        let videos = videos_from_html(html);
+        assert_eq!(videos.len(), 2);
+        assert_eq!(videos[0].viewkey, "abc123");
+        assert_eq!(
+            videos[0].preview.as_deref(),
+            Some("https://cdn.example/abc.jpg")
+        );
+        assert_eq!(videos[1].viewkey, "def456");
+        assert_eq!(videos[1].title, "Second video");
+        assert_eq!(videos[1].preview, None);
+    }
+
+    #[test]
+    fn extracts_channel_links_from_pornhub_cards() {
+        let html = r#"
+            <ul id="videoSearchResult">
+              <li class="videoblock videoBox">
+                <a href="/view_video.php?viewkey=abc" title="First video">
+                  <img data-image="https://cdn.example/abc.jpg">
+                </a>
+                <a href="/model/jane-doe" title="Jane Doe">Jane Doe</a>
+                <a href="/view_video.php?viewkey=abc" title="First video">First video</a>
+              </li>
+              <li class="videoblock videoBox">
+                <a href="/view_video.php?viewkey=def" title="Second video">
+                  <img data-image="https://cdn.example/def.jpg">
+                </a>
+                <a href="/channels/fake-hostel" class="bolded">Fake Hostel</a>
+              </li>
+            </ul>
+        "#;
+        let videos = videos_from_html(html);
+        assert_eq!(videos.len(), 2);
+        assert_eq!(videos[0].channel.as_deref(), Some("Jane Doe"));
+        assert_eq!(
+            videos[0].channel_url.as_deref(),
+            Some("https://www.pornhub.com/model/jane-doe/videos")
+        );
+        assert_eq!(videos[1].channel.as_deref(), Some("Fake Hostel"));
+        assert_eq!(
+            videos[1].channel_url.as_deref(),
+            Some("https://www.pornhub.com/channels/fake-hostel/videos")
+        );
+    }
+
+    #[test]
+    fn thumbnails_are_read_from_listing_markup() {
+        let html = r#"
+            <a href="/view_video.php?viewkey=one" title="One">
+              <img src="data:image/gif;base64,AAAA"
+                   data-thumb_url="https://cdn.example/one.jpg"
+                   data-image="https://cdn.example/one-frame.jpg">
+            </a>
+            <a href="/view_video.php?viewkey=two" title="Two">
+              <img data-image="https://cdn.example/two.mp4/rs:fit:320:180">
+            </a>
+            <a href="/view_video.php?viewkey=three" title="Three"></a>
+        "#;
+        let videos = videos_from_html(html);
+        assert_eq!(
+            videos[0].preview.as_deref(),
+            Some("https://cdn.example/one.jpg")
+        );
+        assert_eq!(
+            videos[1].preview.as_deref(),
+            Some("https://cdn.example/two.mp4/rs:fit:320:180")
+        );
+        assert_eq!(videos[2].preview, None);
+    }
+
+    #[test]
+    fn extracts_and_dedupes_xhamster_videos() {
+        let html = r#"
+            <header>
+              <a data-role="thumb-link" href="https://xhamster.desi/videos/promo-xhPROMO"
+                 aria-label="Header promo"></a>
+            </header>
+            <div data-role="thumb-list-block">
+              <div class="video-thumb">
+                <a data-role="thumb-link"
+                   href="https://xhamster.desi/videos/first-video-xhABC123?from=search"
+                   aria-label="First &amp; best">
+                  <img src="data:image/gif;base64,AAAA"
+                       srcset="https://cdn.example/first-small.jpg 526w"
+                       data-src="https://cdn.example/first.jpg">
+                </a>
+                <a data-role="thumb-link"
+                   href="https://xhamster.desi/videos/first-video-xhABC123"
+                   title="First &amp; best">First &amp; best</a>
+                <a class="video-uploader__name"
+                   href="https://xhamster.desi/creators/first-creator">First Creator</a>
+              </div>
+              <div class="video-thumb">
+                <a data-role="thumb-link" href="/videos/second-video-xhDEF456"
+                   title="Second video">
+                  <img src="https://cdn.example/second.jpg">
+                </a>
+                <a class="video-uploader__name"
+                   href="https://xhamster.desi/creators/second-creator">Second Creator</a>
+              </div>
+              <a data-role="thumb-link" href="https://xhamster.desi/categories/big-tits"
+                 title="Not a video"></a>
+            </div>
+        "#;
+        let videos = xhamster_videos_from_html(html);
+        assert_eq!(videos.len(), 2);
+        assert_eq!(videos[0].viewkey, "xhABC123");
+        assert_eq!(videos[0].title, "First & best");
+        assert_eq!(
+            videos[0].preview.as_deref(),
+            Some("https://cdn.example/first.jpg")
+        );
+        assert_eq!(
+            videos[0].watch_url.as_deref(),
+            Some("https://xhamster.desi/videos/first-video-xhABC123")
+        );
+        assert_eq!(videos[0].channel.as_deref(), Some("First Creator"));
+        assert_eq!(
+            videos[0].channel_url.as_deref(),
+            Some("https://xhamster.desi/creators/first-creator")
+        );
+        assert_eq!(videos[1].viewkey, "xhDEF456");
+        assert_eq!(videos[1].title, "Second video");
+        assert_eq!(
+            videos[1].preview.as_deref(),
+            Some("https://cdn.example/second.jpg")
+        );
+        assert_eq!(
+            videos[1].watch_url.as_deref(),
+            Some("https://xhamster.desi/videos/second-video-xhDEF456")
+        );
+        assert_eq!(videos[1].channel.as_deref(), Some("Second Creator"));
+        assert_eq!(
+            videos[1].channel_url.as_deref(),
+            Some("https://xhamster.desi/creators/second-creator")
+        );
+    }
+
+    #[test]
+    fn xhamster_channel_urls_cover_every_uploader_kind() {
+        assert_eq!(
+            xhamster_channel_url("https://xhamster.desi/creators/priyaqueen"),
+            Some("https://xhamster.desi/creators/priyaqueen".to_string())
+        );
+        assert_eq!(
+            xhamster_channel_url("/channels/jerky-girls"),
+            Some("https://xhamster.desi/channels/jerky-girls".to_string())
+        );
+        assert_eq!(
+            xhamster_channel_url("https://xhamster.desi/users/asian__sensation/videos"),
+            Some("https://xhamster.desi/users/asian__sensation/videos".to_string())
+        );
+        assert_eq!(
+            xhamster_channel_url("/users/asian__sensation"),
+            Some("https://xhamster.desi/users/asian__sensation/videos".to_string())
+        );
+        assert_eq!(
+            xhamster_channel_url("https://xhamster.desi/users/xhamster/blog"),
+            None
+        );
+    }
+
+    #[test]
+    fn viewkeys_stop_at_non_alphanumeric_characters() {
+        assert_eq!(
+            viewkey_from_href("/view_video.php?viewkey=abc-123&x=1"),
+            Some("abc".to_string())
+        );
+        assert_eq!(viewkey_from_href("/view_video.php?viewkey="), None);
+    }
+
+    #[test]
+    fn keeps_the_search_results_and_ignores_header_dropdowns() {
+        // Search pages embed "hottest" and "recommended" dropdown menus above
+        // the real results; only `#videoSearchResult` belongs in the list.
+        let html = r#"
+            <html><body>
+              <ul id="hottestMenuSection" class="videos">
+                <li><a href="/view_video.php?viewkey=menu1" title="Menu video">x</a></li>
+              </ul>
+              <ul id="videoSearchResult" class="videos search-video-thumbs">
+                <li><a href="/view_video.php?viewkey=real1" title="First result">x</a></li>
+                <li><a href="/view_video.php?viewkey=real2" title="Second result">x</a></li>
+              </ul>
+              <ul id="bottomVideos" class="videos">
+                <li><a href="/view_video.php?viewkey=bottom" title="Bottom promo">x</a></li>
+              </ul>
+            </body></html>
+        "#;
+        let videos = videos_from_html(html);
+        let keys: Vec<&str> = videos.iter().map(|v| v.viewkey.as_str()).collect();
+        assert_eq!(keys, ["real1", "real2"]);
+    }
+
+    #[test]
+    fn decodes_entities_in_titles() {
+        let html = r#"
+            <ul id="videoCategory" class="videos">
+              <a href="/view_video.php?viewkey=abc"
+                 title="Tom &amp; Jerry&#039;s &quot;big&quot; scene"></a>
+            </ul>
+        "#;
+        let videos = videos_from_html(html);
+        assert_eq!(videos[0].title, "Tom & Jerry's \"big\" scene");
+    }
+
+    #[test]
+    fn finds_open_graph_images() {
+        let html = r#"
+            <html><head>
+              <meta property="og:title" content="A video" />
+              <meta property="og:image" content="https://cdn.example/one.jpg" />
+              <meta property="og:image:width" content="640" />
+            </head></html>
+        "#;
+        assert_eq!(
+            og_image(html).as_deref(),
+            Some("https://cdn.example/one.jpg")
+        );
+
+        let reversed = r#"<meta content="https://cdn.example/two.jpg" property="og:image">"#;
+        assert_eq!(
+            og_image(reversed).as_deref(),
+            Some("https://cdn.example/two.jpg")
+        );
+
+        assert_eq!(og_image("<html><head></head></html>"), None);
+        assert_eq!(og_image(r#"<meta property="og:image" content="  ">"#), None);
+    }
+
+    #[test]
+    fn resolves_every_preview_url_shape() {
+        let base = "https://www.pornhub.com";
+        assert_eq!(
+            absolute_preview_url("https://cdn.example/a.jpg", base).as_deref(),
+            Some("https://cdn.example/a.jpg")
+        );
+        assert_eq!(
+            absolute_preview_url("//cdn.example/a.jpg", base).as_deref(),
+            Some("https://cdn.example/a.jpg")
+        );
+        assert_eq!(
+            absolute_preview_url("/thumb/a.jpg", base).as_deref(),
+            Some("https://www.pornhub.com/thumb/a.jpg")
+        );
+        assert_eq!(
+            absolute_preview_url("thumb/a.jpg", base).as_deref(),
+            Some("https://www.pornhub.com/thumb/a.jpg")
+        );
+        assert_eq!(absolute_preview_url("data:image/png;base64,AA", base), None);
+        assert_eq!(absolute_preview_url("   ", base), None);
+    }
+
+    #[test]
+    fn picks_the_smallest_srcset_candidate() {
+        let srcset = "https://cdn.example/small.webp 526w, https://cdn.example/big.webp 1280w";
+        assert_eq!(first_srcset_url(srcset), "https://cdn.example/small.webp");
+        assert_eq!(
+            first_srcset_url("  https://cdn.example/only.jpg 1x "),
+            "https://cdn.example/only.jpg"
+        );
+    }
+
+    #[test]
+    fn relative_og_images_use_the_site_origin() {
+        assert_eq!(
+            url_origin("https://xhamster.desi/videos/some-slug-xhABC123"),
+            "https://xhamster.desi"
+        );
+        assert_eq!(
+            absolute_preview_url(
+                "/thumb/a.jpg",
+                &url_origin("https://xhamster.desi/videos/x")
+            )
+            .as_deref(),
+            Some("https://xhamster.desi/thumb/a.jpg")
+        );
+    }
+
+    #[test]
+    fn xhamster_feed_urls_match_the_site_bar() {
+        assert_eq!(
+            xhamster_feed_url(FeedKind::Recommendations, 4),
+            "https://xhamster.desi"
+        );
+        assert_eq!(
+            xhamster_feed_url(FeedKind::Hottest, 1),
+            "https://xhamster.desi/best/weekly"
+        );
+        assert_eq!(
+            xhamster_feed_url(FeedKind::MostViewed, 2),
+            "https://xhamster.desi/best/2"
+        );
+        assert_eq!(
+            xhamster_feed_url(FeedKind::Newest, 3),
+            "https://xhamster.desi/newest/3"
+        );
+        assert_eq!(
+            xhamster_feed_url(FeedKind::TopRated, 1),
+            "https://xhamster.desi/best/monthly"
+        );
+    }
+
+    #[test]
+    fn eporner_feed_urls_match_the_site_bar() {
+        assert_eq!(
+            eporner_feed_url(FeedKind::Recommendations, 4),
+            "https://www.eporner.com/"
+        );
+        assert_eq!(
+            eporner_feed_url(FeedKind::Hottest, 1),
+            "https://www.eporner.com/best-videos/"
+        );
+        assert_eq!(
+            eporner_feed_url(FeedKind::Hottest, 2),
+            "https://www.eporner.com/best-videos/2/"
+        );
+        assert_eq!(
+            eporner_feed_url(FeedKind::MostViewed, 1),
+            "https://www.eporner.com/most-viewed/"
+        );
+        assert_eq!(
+            eporner_feed_url(FeedKind::MostViewed, 2),
+            "https://www.eporner.com/2/most-viewed/"
+        );
+        assert_eq!(
+            eporner_feed_url(FeedKind::Newest, 1),
+            "https://www.eporner.com/recent/"
+        );
+        assert_eq!(
+            eporner_feed_url(FeedKind::Newest, 3),
+            "https://www.eporner.com/3/recent/"
+        );
+        assert_eq!(
+            eporner_feed_url(FeedKind::TopRated, 2),
+            "https://www.eporner.com/top-rated/2/"
+        );
+    }
+
+    #[test]
+    fn extracts_eporner_cards_and_uploaders() {
+        let html = r#"
+            <div class="mb" data-id="18995176">
+              <div class="mbimg"><div class="mbcontent">
+                <a href="/video-YDmO8r01udK/lesbian-girls/">
+                  <img src="https://static-sg-cdn.eporner.com/thumbs/one.jpg" alt="One" />
+                </a>
+              </div></div>
+              <div class="mbunder">
+                <p class="mbtit"><a href="/video-YDmO8r01udK/lesbian-girls/">Lesbian &amp; Friends</a></p>
+                <span class="mb-uploader"><a href="/profile/Brancos182/" title="Uploader">Brancos182</a></span>
+              </div>
+            </div>
+            <div class="mb" data-id="19012213">
+              <a href="/hd-porn/VogGvwqKL64/hd-cut/">
+                <img class="lazyimg" src="data:image/gif;base64,AAAA"
+                     data-src="//static-sg-cdn.eporner.com/thumbs/two.jpg" alt="Two" />
+              </a>
+              <p class="mbtit"><a href="/hd-porn/VogGvwqKL64/hd-cut/">HD Cut</a></p>
+            </div>
+            <a href="/video-outside/x/">Outside card</a>
+        "#;
+        let videos = eporner_videos_from_html(html);
+        assert_eq!(videos.len(), 2);
+        assert_eq!(videos[0].viewkey, "epYDmO8r01udK");
+        assert_eq!(videos[0].title, "Lesbian & Friends");
+        assert_eq!(
+            videos[0].preview.as_deref(),
+            Some("https://static-sg-cdn.eporner.com/thumbs/one.jpg")
+        );
+        assert_eq!(
+            videos[0].watch_url.as_deref(),
+            Some("https://www.eporner.com/video-YDmO8r01udK/lesbian-girls/")
+        );
+        assert_eq!(videos[0].channel.as_deref(), Some("Brancos182"));
+        assert_eq!(
+            videos[0].channel_url.as_deref(),
+            Some("https://www.eporner.com/profile/Brancos182/uploaded-videos/")
+        );
+
+        assert_eq!(videos[1].viewkey, "epVogGvwqKL64");
+        assert_eq!(videos[1].title, "HD Cut");
+        assert_eq!(
+            videos[1].preview.as_deref(),
+            Some("https://static-sg-cdn.eporner.com/thumbs/two.jpg")
+        );
+        assert_eq!(
+            videos[1].watch_url.as_deref(),
+            Some("https://www.eporner.com/hd-porn/VogGvwqKL64/hd-cut/")
+        );
+        assert_eq!(videos[1].channel, None);
+    }
+
+    #[test]
+    fn eporner_watch_and_channel_urls_are_normalized() {
+        assert_eq!(
+            eporner_watch_url("/video-YDmO8r01udK/slug/"),
+            Some((
+                "https://www.eporner.com/video-YDmO8r01udK/slug/".to_string(),
+                "YDmO8r01udK".to_string()
+            ))
+        );
+        assert_eq!(
+            eporner_watch_url("https://www.eporner.com/hd-porn/VogGvwqKL64/slug/"),
+            Some((
+                "https://www.eporner.com/hd-porn/VogGvwqKL64/slug/".to_string(),
+                "VogGvwqKL64".to_string()
+            ))
+        );
+        assert_eq!(eporner_watch_url("/video-/slug/"), None);
+        assert_eq!(eporner_watch_url("/cat/big-tits/"), None);
+
+        assert_eq!(
+            eporner_channel_url("/profile/Brancos182/"),
+            Some("https://www.eporner.com/profile/Brancos182/uploaded-videos/".to_string())
+        );
+        assert_eq!(
+            eporner_channel_url("https://www.eporner.com/profile/Brancos182/uploaded-videos/2/"),
+            Some("https://www.eporner.com/profile/Brancos182/uploaded-videos/".to_string())
+        );
+        assert_eq!(eporner_channel_url("/profile/"), None);
+    }
+
+    #[test]
+    fn eporner_search_tag_urls_stay_on_tag_pages() {
+        assert_eq!(
+            eporner_search_tag_url("https://www.eporner.com/tag/big-tits/"),
+            Some("https://www.eporner.com/tag/big-tits/".to_string())
+        );
+        assert_eq!(
+            eporner_search_tag_url("https://www.eporner.com/tag/pov-e6rjibna"),
+            Some("https://www.eporner.com/tag/pov-e6rjibna/".to_string())
+        );
+        assert_eq!(
+            eporner_search_tag_url("https://www.eporner.com/cat/big-tits/"),
+            None
+        );
+        assert_eq!(eporner_search_tag_url("https://www.eporner.com/"), None);
+    }
+
+    #[test]
+    fn eporner_category_names_drop_the_porn_suffix() {
+        let document =
+            Html::parse_fragment(r#"<a href="/cat/big-tits/" title="Big Tits Porn">Big Tits</a>"#);
+        let selector = Selector::parse("a[href]").expect("static selector is valid");
+        let anchor = document.select(&selector).next().expect("anchor");
+        assert_eq!(eporner_category_name(&anchor).as_deref(), Some("Big Tits"));
+    }
+
+    /// Hits the real site; run with `cargo test -- --ignored`.
+    #[test]
+    #[ignore]
+    fn live_home_feeds() {
+        for feed in FeedKind::ALL {
+            let videos = feed_videos(feed, 1).expect("home feed request");
+            assert!(!videos.is_empty(), "{} was empty", feed.label());
+            assert!(
+                videos.iter().any(|video| video.preview.is_some()),
+                "{} carried no thumbnails",
+                feed.label()
+            );
+        }
+    }
+
+    /// Hits the real site; run with `cargo test -- --ignored`.
+    #[test]
+    #[ignore]
+    fn live_xhamster_home_feeds() {
+        for feed in FeedKind::ALL {
+            let videos = xhamster_feed_videos(feed, 1).expect("xHamster home feed request");
+            assert!(!videos.is_empty(), "{} was empty", feed.label());
+            assert!(
+                videos.iter().any(|video| video.preview.is_some()),
+                "{} carried no thumbnails",
+                feed.label()
+            );
+        }
+    }
+
+    /// Hits the real site; run with `cargo test -- --ignored`.
+    #[test]
+    #[ignore]
+    fn live_categories() {
+        let categories = categories().expect("categories request");
+        assert!(!categories.is_empty());
+        assert!(categories.iter().any(|c| c.name == "Big Tits"));
+    }
+
+    /// Hits the real site; run with `cargo test -- --ignored`.
+    #[test]
+    #[ignore]
+    fn live_xhamster_categories() {
+        let categories = xhamster_categories().expect("xHamster categories request");
+        assert!(!categories.is_empty());
+        assert!(categories.iter().any(|category| category.name == "Asian"));
+    }
+
+    /// Hits the real site; run with `cargo test -- --ignored`.
+    #[test]
+    #[ignore]
+    fn live_category_videos() {
+        let videos = category_videos("37", 1).expect("video request");
+        assert!(!videos.is_empty());
+    }
+
+    /// Hits the real site; run with `cargo test -- --ignored`.
+    #[test]
+    #[ignore]
+    fn live_search() {
+        let videos = search_videos("big tits", 1).expect("search request");
+        assert!(!videos.is_empty());
+        assert!(
+            videos.iter().any(|video| video.preview.is_some()),
+            "listing page carried no thumbnails"
+        );
+        assert!(
+            videos.iter().any(|video| video.channel_url.is_some()),
+            "listing page carried no channel links"
+        );
+        // Regression: title keyword filtering used to drop every `pov` hit.
+        let pov = search_videos("pov", 1).expect("pov search request");
+        assert!(!pov.is_empty(), "pov search returned nothing");
+    }
+
+    /// Hits the real site; run with `cargo test -- --ignored`.
+    #[test]
+    #[ignore]
+    fn live_xhamster_search() {
+        let videos = xhamster_search("big tits", 1).expect("xHamster search request");
+        assert!(!videos.is_empty(), "xHamster search returned nothing");
+        assert!(
+            videos.iter().any(|video| video.preview.is_some()),
+            "xHamster listing carried no thumbnails"
+        );
+        assert!(
+            videos.iter().any(|video| video.channel_url.is_some()),
+            "xHamster listing carried no creator links"
+        );
+        assert!(
+            videos.iter().all(|video| video
+                .watch_url
+                .as_deref()
+                .is_some_and(|url| url.starts_with("https://xhamster.desi/videos/"))),
+            "xHamster results must carry full watch URLs"
+        );
+    }
+
+    /// Hits the real site; run with `cargo test -- --ignored`.
+    #[test]
+    #[ignore]
+    fn live_channel_videos() {
+        let pornhub = channel_videos("https://www.pornhub.com/model/sofi-becker/videos", 1)
+            .expect("PornHub channel request");
+        assert!(!pornhub.is_empty(), "PornHub channel returned nothing");
+
+        let xhamster = channel_videos("https://xhamster.desi/creators/renatinharj", 1)
+            .expect("xHamster creator request");
+        assert!(!xhamster.is_empty(), "xHamster creator returned nothing");
+        assert!(
+            xhamster
+                .iter()
+                .any(|video| video.watch_url.as_deref().is_some()),
+            "xHamster creator results must carry watch URLs"
+        );
+    }
+
+    /// Hits the real site; run with `cargo test -- --ignored`.
+    #[test]
+    #[ignore]
+    fn live_preview_url() {
+        let videos = search_videos("big tits", 1).expect("search request");
+        let video = videos.first().expect("at least one result");
+        let url = preview_url(&video.viewkey).expect("preview url");
+        assert!(url.starts_with("http"), "unexpected preview url: {url}");
+    }
+
+    /// Hits the real site; run with `cargo test -- --ignored`.
+    #[test]
+    #[ignore]
+    fn live_eporner_home_feeds() {
+        for feed in FeedKind::ALL {
+            let videos = eporner_feed_videos(feed, 1).expect("Eporner home feed request");
+            assert!(!videos.is_empty(), "{} was empty", feed.label());
+            assert!(
+                videos.iter().any(|video| video.preview.is_some()),
+                "{} carried no thumbnails",
+                feed.label()
+            );
+            assert!(
+                videos.iter().all(|video| video
+                    .watch_url
+                    .as_deref()
+                    .is_some_and(|url| url.starts_with("https://www.eporner.com/"))),
+                "{} results must carry full watch URLs",
+                feed.label()
+            );
+        }
+    }
+
+    /// Hits the real site; run with `cargo test -- --ignored`.
+    #[test]
+    #[ignore]
+    fn live_eporner_categories_and_videos() {
+        let categories = eporner_categories().expect("Eporner categories request");
+        assert!(!categories.is_empty());
+        assert!(categories
+            .iter()
+            .any(|category| category.name == "Big Tits"));
+
+        let videos = eporner_category_videos("big-tits", 1).expect("Eporner category request");
+        assert!(!videos.is_empty(), "Eporner category returned nothing");
+        let page_two = eporner_category_videos("big-tits", 2).expect("Eporner category page 2");
+        assert!(
+            !page_two.is_empty(),
+            "Eporner category page 2 returned nothing"
+        );
+    }
+
+    /// Hits the real site; run with `cargo test -- --ignored`.
+    #[test]
+    #[ignore]
+    fn live_eporner_search() {
+        let videos = eporner_search("big tits", 1).expect("Eporner search request");
+        assert!(!videos.is_empty(), "Eporner search returned nothing");
+        assert!(
+            videos.iter().any(|video| video.preview.is_some()),
+            "Eporner listing carried no thumbnails"
+        );
+        assert!(
+            videos.iter().any(|video| video.channel_url.is_some()),
+            "Eporner listing carried no uploader links"
+        );
+        let page_two = eporner_search("big tits", 2).expect("Eporner search page 2");
+        assert!(
+            !page_two.is_empty(),
+            "Eporner search page 2 returned nothing"
+        );
+
+        let missing = eporner_search("zzzzqqqxyz", 1).expect("Eporner empty search");
+        assert!(missing.is_empty(), "nonsense query should have no results");
+    }
+
+    /// Hits the real site; run with `cargo test -- --ignored`.
+    #[test]
+    #[ignore]
+    fn live_eporner_channel_videos() {
+        let videos = eporner_search("big tits", 1).expect("Eporner search request");
+        let channel = videos
+            .iter()
+            .find_map(|video| video.channel_url.clone())
+            .expect("at least one uploader");
+        let uploads = channel_videos(&channel, 1).expect("Eporner channel request");
+        assert!(!uploads.is_empty(), "Eporner channel returned nothing");
+        assert!(
+            uploads
+                .iter()
+                .all(|video| video.watch_url.as_deref().is_some()),
+            "Eporner channel results must carry watch URLs"
+        );
+    }
+}

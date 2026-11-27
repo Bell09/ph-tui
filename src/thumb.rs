@@ -31,6 +31,7 @@ const DOWNLOAD_ATTEMPTS: usize = 2;
 
 const PORNHUB_REFERRER: &str = "https://www.pornhub.com/";
 const XHAMSTER_REFERRER: &str = "https://xhamster.desi/";
+const EPORNER_REFERRER: &str = "https://www.eporner.com/";
 
 /// Ask the terminal which image protocol and font size it supports, falling
 /// back to unicode half-blocks on anything that does not answer.
@@ -92,24 +93,6 @@ pub fn load(url: &str, cache_path: &Path) -> Result<DynamicImage> {
 
     let image = decode_preview(&bytes).context("could not decode preview image")?;
     Ok(normalize(image))
-}
-
-/// Download a preview into the disk cache without decoding it for the UI.
-/// Used to warm neighbors so the next selection often hits disk immediately.
-pub fn warm(url: &str, cache_path: &Path) {
-    if cache_path.is_file() {
-        return;
-    }
-    let Ok(bytes) = download(url) else {
-        return;
-    };
-    if bytes.is_empty() {
-        return;
-    }
-    write_cache(cache_path, &bytes);
-    if let Some(parent) = cache_path.parent() {
-        prune(parent, MAX_CACHE_FILES, MAX_CACHE_BYTES);
-    }
 }
 
 fn cached_bytes(path: &Path) -> Option<Vec<u8>> {
@@ -223,7 +206,9 @@ fn fetch_once(url: &str, retry: bool) -> Result<Vec<u8>> {
 }
 
 fn referer_for(url: &str) -> &'static str {
-    if url.contains("xhamster") || url.contains("xhcdn") {
+    if url.contains("eporner") {
+        EPORNER_REFERRER
+    } else if url.contains("xhamster") || url.contains("xhcdn") {
         XHAMSTER_REFERRER
     } else {
         PORNHUB_REFERRER
@@ -324,6 +309,14 @@ mod tests {
         assert_eq!(
             referer_for("https://xhamster.desi/thumb.jpg"),
             XHAMSTER_REFERRER
+        );
+        assert_eq!(
+            referer_for("https://static-sg-cdn.eporner.com/thumbs/a.jpg"),
+            EPORNER_REFERRER
+        );
+        assert_eq!(
+            referer_for("https://www.eporner.com/thumb.jpg"),
+            EPORNER_REFERRER
         );
     }
 

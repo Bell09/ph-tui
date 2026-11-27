@@ -45,12 +45,14 @@ enum Nav {
     Quit,
 }
 
-/// Which site's home feed is currently on screen. `x` toggles this, so the
-/// feed bar and `/` search always follow the active site.
+/// Which site's home feed is currently on screen. `x` toggles PornHub and
+/// xHamster, while `e` switches Eporner in and out, so the feed bar and `/`
+/// search always follow the active site.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum HomeSite {
     Pornhub,
     Xhamster,
+    Eporner,
 }
 
 impl HomeSite {
@@ -58,6 +60,7 @@ impl HomeSite {
         match self {
             HomeSite::Pornhub => "Pornhub",
             HomeSite::Xhamster => "XHamster",
+            HomeSite::Eporner => "Eporner",
         }
     }
 
@@ -65,6 +68,14 @@ impl HomeSite {
         match self {
             HomeSite::Pornhub => HomeSite::Xhamster,
             HomeSite::Xhamster => HomeSite::Pornhub,
+            HomeSite::Eporner => HomeSite::Xhamster,
+        }
+    }
+
+    fn to_eporner(self) -> Self {
+        match self {
+            HomeSite::Eporner => HomeSite::Pornhub,
+            _ => HomeSite::Eporner,
         }
     }
 }
@@ -107,8 +118,10 @@ enum UpdateState {
 enum Source {
     Category(Category),
     XhamsterCategory(Category),
+    EpornerCategory(Category),
     Search(String),
     Xhamster { query: String },
+    Eporner { query: String },
     Channel { name: String, url: String },
 }
 
@@ -117,8 +130,10 @@ impl Source {
         match self {
             Source::Category(category) => format!("Categories · {}", category.name),
             Source::XhamsterCategory(category) => format!("XHamster · {}", category.name),
+            Source::EpornerCategory(category) => format!("Eporner · {}", category.name),
             Source::Search(query) => format!("Search · {query}"),
             Source::Xhamster { query } => format!("XHamster · {query}"),
+            Source::Eporner { query } => format!("Eporner · {query}"),
             Source::Channel { name, .. } => format!("Channel · {name}"),
         }
     }
@@ -127,8 +142,10 @@ impl Source {
         match self {
             Source::Category(_) => "Videos",
             Source::XhamsterCategory(_) => "XHamster Videos",
+            Source::EpornerCategory(_) => "Eporner Videos",
             Source::Search(_) => "Results",
             Source::Xhamster { .. } => "XHamster Results",
+            Source::Eporner { .. } => "Eporner Results",
             Source::Channel { .. } => "Channel Videos",
         }
     }
@@ -139,8 +156,10 @@ impl Source {
             Source::XhamsterCategory(category) => {
                 http::xhamster_category_videos(&category.id, page)
             }
+            Source::EpornerCategory(category) => http::eporner_category_videos(&category.id, page),
             Source::Search(query) => http::search_videos(query, page),
             Source::Xhamster { query } => http::xhamster_search(query, page),
+            Source::Eporner { query } => http::eporner_search(query, page),
             Source::Channel { url, .. } => http::channel_videos(url, page),
         }
     }
@@ -538,6 +557,7 @@ impl App {
                     move || match site {
                         HomeSite::Pornhub => http::feed_videos(active, page),
                         HomeSite::Xhamster => http::xhamster_feed_videos(active, page),
+                        HomeSite::Eporner => http::eporner_feed_videos(active, page),
                     },
                 )?
                 .unwrap_or_default();
@@ -622,6 +642,10 @@ impl App {
                         self.site = self.site.toggle();
                         next = Some((FeedKind::Recommendations, 1));
                     }
+                    Key::Char('e') => {
+                        self.site = self.site.to_eporner();
+                        next = Some((FeedKind::Recommendations, 1));
+                    }
                     Key::Char('2') | Key::Char('u') => return Ok(Nav::Update),
                     Key::Char('q') => return Ok(Nav::Quit),
                     Key::Ctrl('c') => self.quit(),
@@ -675,6 +699,7 @@ impl App {
             move || match site {
                 HomeSite::Pornhub => http::categories(),
                 HomeSite::Xhamster => http::xhamster_categories(),
+                HomeSite::Eporner => http::eporner_categories(),
             },
         )?;
         let Some(categories) = categories else {
@@ -714,6 +739,9 @@ impl App {
                         HomeSite::Xhamster => {
                             self.browse_results(term, Source::XhamsterCategory(category))?
                         }
+                        HomeSite::Eporner => {
+                            self.browse_results(term, Source::EpornerCategory(category))?
+                        }
                     }
                 }
             }
@@ -721,11 +749,13 @@ impl App {
     }
 
     /// Search follows the active home site: PornHub by default, xHamster after
-    /// pressing `x`. The site toggle stays in effect when returning home.
+    /// pressing `x`, or Eporner after pressing `e`. The site choice stays in
+    /// effect when returning home.
     fn search(&mut self, term: &mut Term) -> Result<()> {
         let (title, hint) = match self.site {
             HomeSite::Pornhub => ("Search query", "Type a query and press Enter."),
             HomeSite::Xhamster => ("xHamster search", "Type a query and press Enter."),
+            HomeSite::Eporner => ("Eporner search", "Type a query and press Enter."),
         };
         let initial = self.last_query.clone();
         let query = self.text_input(term, title, hint, &initial)?;
@@ -739,6 +769,7 @@ impl App {
         match self.site {
             HomeSite::Pornhub => self.browse_results(term, Source::Search(query)),
             HomeSite::Xhamster => self.browse_results(term, Source::Xhamster { query }),
+            HomeSite::Eporner => self.browse_results(term, Source::Eporner { query }),
         }
     }
 
@@ -1855,12 +1886,13 @@ fn render_feed_bar(frame: &mut Frame, area: Rect, active: FeedKind, theme: &Them
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-/// Home keybind guide shown on the bottom status row. The `x` hint names the
-/// site you would switch to, so it flips when the home feed changes.
+/// Home keybind guide shown on the bottom status row. The site hints flip so
+/// they always name the destination of `x` and `e`.
 fn home_hints(site: HomeSite) -> [(&'static str, &'static str); 8] {
-    let switch_to = match site {
-        HomeSite::Pornhub => "xhamster",
-        HomeSite::Xhamster => "pornhub",
+    let (first, second) = match site {
+        HomeSite::Pornhub => (("x", "xhamster"), ("e", "eporner")),
+        HomeSite::Xhamster => (("x", "pornhub"), ("e", "eporner")),
+        HomeSite::Eporner => (("e", "pornhub"), ("x", "xhamster")),
     };
     [
         ("↑↓", "move"),
@@ -1868,8 +1900,8 @@ fn home_hints(site: HomeSite) -> [(&'static str, &'static str); 8] {
         ("tab", "feed"),
         ("c", "channel"),
         ("/", "search"),
-        ("x", switch_to),
-        ("b", "browse"),
+        first,
+        second,
         ("q", "quit"),
     ]
 }
@@ -2131,6 +2163,7 @@ mod tests {
         assert!(screen.contains("A recommended video"), "{screen}");
         assert!(screen.contains("c channel"), "missing c hint: {screen}");
         assert!(screen.contains("x xhamster"), "missing x hint: {screen}");
+        assert!(screen.contains("e eporner"), "missing e hint: {screen}");
     }
 
     #[test]
@@ -2147,6 +2180,21 @@ mod tests {
             !screen.contains("x xhamster"),
             "stale toggle hint: {screen}"
         );
+    }
+
+    #[test]
+    fn e_switches_to_eporner_and_back() {
+        assert_eq!(HomeSite::Pornhub.to_eporner(), HomeSite::Eporner);
+        assert_eq!(HomeSite::Xhamster.to_eporner(), HomeSite::Eporner);
+        assert_eq!(HomeSite::Eporner.to_eporner(), HomeSite::Pornhub);
+        assert_eq!(HomeSite::Eporner.toggle(), HomeSite::Xhamster);
+
+        let mut app = App::headless();
+        app.site = HomeSite::Eporner;
+        let screen = render_feed(&mut app, FeedKind::Recommendations, 140, 40);
+        assert!(screen.contains("Eporner · Recommendations"), "{screen}");
+        assert!(screen.contains("e pornhub"), "missing e hint: {screen}");
+        assert!(screen.contains("x xhamster"), "missing x hint: {screen}");
     }
 
     #[test]
