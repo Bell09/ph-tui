@@ -1862,21 +1862,28 @@ fn render_feed_bar(frame: &mut Frame, area: Rect, active: FeedKind, theme: &Them
             spans.push(Span::styled("  ·  ", Style::default().fg(theme.faint)));
         }
         let selected = *feed == active;
-        let style = if selected {
+        let label_style = if selected {
             Style::default()
                 .fg(theme.accent)
                 .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(theme.dim)
         };
-        spans.push(Span::styled(feed.key(), style));
-        spans.push(Span::styled(format!(" {}", feed.label()), style));
+        // r/h/v/n/t/b get their own palette colour, so the bar reads as a
+        // compact rainbow drawn from the active wallpaper's pywal colours.
+        spans.push(Span::styled(
+            feed.key(),
+            Style::default()
+                .fg(theme.palette[1 + index])
+                .add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::styled(format!(" {}", feed.label()), label_style));
     }
     spans.push(Span::styled("  ·  ", Style::default().fg(theme.faint)));
     spans.push(Span::styled(
         "b",
         Style::default()
-            .fg(theme.accent_soft)
+            .fg(theme.palette[6])
             .add_modifier(Modifier::BOLD),
     ));
     spans.push(Span::styled(
@@ -2164,6 +2171,49 @@ mod tests {
         assert!(screen.contains("c channel"), "missing c hint: {screen}");
         assert!(screen.contains("x xhamster"), "missing x hint: {screen}");
         assert!(screen.contains("e eporner"), "missing e hint: {screen}");
+    }
+
+    #[test]
+    fn feed_keys_use_the_pywal_palette_colours() {
+        let mut app = App::headless();
+        let mut list = List::new(vec![Item::new(
+            Kind::Video,
+            "abc123",
+            "A recommended video",
+        )]);
+        let backend = TestBackend::new(140, 40);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|frame| {
+            app.render_feed_page(frame, FeedKind::Recommendations, 1, &mut list);
+        })
+        .unwrap();
+
+        let buffer = term.backend().buffer();
+        let row = 2;
+        let line: String = (0..buffer.area.width)
+            .map(|x| buffer[(x, row)].symbol())
+            .collect();
+        for (key, slot, label) in [
+            ('r', 1, "Recommendations"),
+            ('h', 2, "Hottest"),
+            ('v', 3, "Most Viewed"),
+            ('n', 4, "Newest"),
+            ('t', 5, "Top Rated"),
+            ('b', 6, "Browse categories"),
+        ] {
+            let needle = format!("{key} {label}");
+            let start = line
+                .find(&needle)
+                .unwrap_or_else(|| panic!("missing {needle} in feed bar: {line}"));
+            // `find` returns a byte offset, but the buffer is cell based and
+            // the "·" separators are multibyte.
+            let x = line[..start].chars().count() as u16;
+            assert_eq!(
+                buffer[(x, row)].fg,
+                app.theme.palette[slot],
+                "key {key} should use palette slot {slot}"
+            );
+        }
     }
 
     #[test]

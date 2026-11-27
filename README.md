@@ -30,7 +30,8 @@ Rust. The interface is built with `ratatui`, previews use `ratatui-image`, and
 - **Fast filtering** — fuzzy match with highlighted characters, paging and a
   scrollbar, all in-process
 - **Home feeds** — a feed bar with Recommendations, Hottest, Most Viewed, Newest
-  and Top Rated; each feed loads real videos with inline previews
+  and Top Rated; each feed loads real videos with inline previews. The `r`, `h`,
+  `v`, `n`, `t` and `b` shortcuts take their colours from the pywal palette
 - **Categories and search** — fetch from the active site directly, page through results
 - **Site switching** — press `x` on home to toggle the feed bar between PornHub
   and xHamster; press `e` to switch to Eporner, and `e` again to return to

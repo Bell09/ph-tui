@@ -30,6 +30,26 @@ pub const DEFAULT_SUCCESS: Color = Color::Rgb(126, 201, 140);
 pub const DEFAULT_ERROR: Color = Color::Rgb(240, 112, 112);
 pub const DEFAULT_SELECTED_BG: Color = Color::Rgb(46, 32, 50);
 
+/// Built-in 16-colour palette used when no wallpaper tool is installed.
+pub const DEFAULT_PALETTE: [Color; 16] = [
+    Color::Rgb(24, 24, 28),
+    DEFAULT_ERROR,
+    DEFAULT_SUCCESS,
+    DEFAULT_WARN,
+    Color::Rgb(120, 160, 240),
+    Color::Rgb(200, 140, 240),
+    DEFAULT_ACCENT_SOFT,
+    DEFAULT_TEXT,
+    Color::Rgb(152, 152, 164),
+    DEFAULT_ERROR,
+    DEFAULT_SUCCESS,
+    DEFAULT_WARN,
+    Color::Rgb(120, 160, 240),
+    Color::Rgb(200, 140, 240),
+    DEFAULT_ACCENT_SOFT,
+    DEFAULT_TEXT,
+];
+
 /// Semantic colours used by every view. `Copy` so views can snapshot the
 /// whole theme at the start of a frame without fighting mutable borrows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,6 +63,9 @@ pub struct Theme {
     pub success: Color,
     pub error: Color,
     pub selected_bg: Color,
+    /// Raw pywal/ANSI slots, kept so individual shortcuts can use palette
+    /// colours that don't have a semantic role.
+    pub palette: [Color; 16],
 }
 
 impl Default for Theme {
@@ -57,6 +80,7 @@ impl Default for Theme {
             success: DEFAULT_SUCCESS,
             error: DEFAULT_ERROR,
             selected_bg: DEFAULT_SELECTED_BG,
+            palette: DEFAULT_PALETTE,
         }
     }
 }
@@ -137,6 +161,7 @@ impl Theme {
                 Color::Rgb(ar, ag, ab) => mix(background, (ar, ag, ab), 0.22),
                 _ => mix(background, (255, 92, 141), 0.22),
             },
+            palette: p,
         }
     }
 }
@@ -614,6 +639,9 @@ mod tests {
         assert_eq!(theme.error, Color::Rgb(0xd6, 0x4d, 0x4d));
         assert_eq!(theme.warn, Color::Rgb(0xc8, 0xa0, 0x3c));
         assert_eq!(theme.success, Color::Rgb(0x52, 0xa4, 0x52));
+        // Raw slots survive so shortcut keys can use their own colours.
+        assert_eq!(theme.palette[1], Color::Rgb(0xd6, 0x4d, 0x4d));
+        assert_eq!(theme.palette[2], Color::Rgb(0x52, 0xa4, 0x52));
         // faint and selected_bg are derived from background + accent.
         assert!(matches!(theme.faint, Color::Rgb(_, _, _)));
         assert!(matches!(theme.selected_bg, Color::Rgb(_, _, _)));
