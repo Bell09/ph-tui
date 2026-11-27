@@ -1830,7 +1830,7 @@ fn chrome_layout(area: Rect) -> [Rect; 5] {
 }
 
 /// The two hairline dividers in the minimal chrome: one under the header,
-/// one above the status/keybind row.
+/// one above the status/keybind row. They pick up the active pywal accent.
 fn render_rule(frame: &mut Frame, area: Rect, theme: &Theme) {
     if area.width == 0 || area.height == 0 {
         return;
@@ -1838,7 +1838,7 @@ fn render_rule(frame: &mut Frame, area: Rect, theme: &Theme) {
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
             "─".repeat(area.width as usize),
-            Style::default().fg(theme.faint),
+            Style::default().fg(theme.accent),
         ))),
         area,
     );
@@ -2264,6 +2264,33 @@ mod tests {
             .filter(|line| !line.is_empty() && line.chars().all(|ch| ch == '─'))
             .count();
         assert_eq!(rules, 2, "expected two chrome rules: {screen}");
+    }
+
+    #[test]
+    fn rules_follow_the_active_pywal_accent() {
+        let mut app = App::headless();
+        let mut list = List::new(vec![Item::new(Kind::Video, "abc", "Alpha")]);
+        let backend = TestBackend::new(120, 36);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|frame| {
+            app.render_list_page(frame, "Search · test", "Results", &mut list, true, &[]);
+        })
+        .unwrap();
+
+        let buffer = term.backend().buffer();
+        let rule_rows: Vec<u16> = (0..buffer.area.height)
+            .filter(|&y| (0..buffer.area.width).all(|x| buffer[(x, y)].symbol() == "─"))
+            .collect();
+        assert_eq!(rule_rows.len(), 2, "expected two rules");
+        for y in rule_rows {
+            for x in 0..buffer.area.width {
+                assert_eq!(
+                    buffer[(x, y)].fg,
+                    app.theme.accent,
+                    "rule at ({x}, {y}) is not using the accent"
+                );
+            }
+        }
     }
 
     #[test]

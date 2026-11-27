@@ -23,8 +23,8 @@ Rust. The interface is built with `ratatui`, previews use `ratatui-image`, and
 ## Features
 
 - **Native TUI** — header, split browser, details pane, status line and key hints
-- **Minimal chrome** — no panel boxes; two single-line rules frame the content,
-  with status and keybind guide sharing one utui-style row
+- **Minimal chrome** — no panel boxes; two single-line rules in the pywal
+  accent frame the content, with status and keybind guide sharing one utui-style row
 - **Inline previews** — kitty, sixel or iTerm2 graphics, with unicode half-block
   fallback on terminals that support neither
 - **Fast filtering** — fuzzy match with highlighted characters, paging and a
